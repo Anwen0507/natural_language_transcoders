@@ -42,7 +42,7 @@ from nla.config import NLAConfig, load_nla_config_from_args, write_model_sidecar
 from nla.injection import inject_at_marked_positions
 from nla.models import NLACriticModel, embed_dump_path
 from nla.schema import (
-    MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY, TARGET_ACTIVATION_COLUMN,
+    MM_ACTIVATION_KEY, MM_CRITIC_GOLD_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY, TARGET_ACTIVATION_COLUMN,
     load_predict_mean_baselines, normalize_activation, transcoder_delta_mode,
 )
 from nla.storage import _load_storage, is_remote
