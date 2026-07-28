@@ -41,7 +41,10 @@ from nla.arch_adapters import resolve_embed_scale
 from nla.config import load_nla_config_from_args
 from nla.injection import inject_at_marked_positions
 from nla.models import embed_dump_path, load_embedding_only
-from nla.schema import MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, extract_explanation, normalize_activation
+from nla.schema import (
+    MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, TARGET_ACTIVATION_COLUMN,
+    extract_explanation, normalize_activation, transcoder_delta_mode, transcoder_gold,
+)
 
 
 _TOKENIZER = None
@@ -50,6 +53,7 @@ _EMBED: torch.nn.Embedding | None = None
 _EMBED_SCALE: float = 1.0
 _EMBED_MTIME: float = 0.0
 _PREFILL_LEAK_PINGED = False
+_DELTA: bool = False  # transcoder delta mode (NLA_TRANSCODER_DELTA), set in _lazy_init
 
 # bf16-base64: ~12MB JSON body → ~2.8MB string. sglang casts to bf16 on
 # receipt anyway (schedule_batch hunk in nla_input_embeds.patch), so bf16
@@ -71,7 +75,7 @@ _ENGINE_URLS_LOCK = asyncio.Lock()
 
 
 def _lazy_init(args):
-    global _TOKENIZER, _CFG, _EMBED, _EMBED_SCALE
+    global _TOKENIZER, _CFG, _EMBED, _EMBED_SCALE, _DELTA
     if _TOKENIZER is not None:
         return
     _TOKENIZER = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -88,6 +92,9 @@ def _lazy_init(args):
         "from sample.prompt, ignores prior partial response)"
     )
     _CFG = cfg
+    _DELTA = transcoder_delta_mode()
+    if _DELTA:
+        print("[NLA] transcoder DELTA mode ON — critic gold = v_target − v_source (v_M − v_N)")
     # bf16 storage — the bf16→fp32 conversion of 1GB (whole table) was ~1s per
     # reload. Instead convert only the looked-up rows (~125×3584 ≈ 900KB) per
     # request in generate().
@@ -346,9 +353,19 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         args, sample, payload={"input_ids": input_ids}, output=output
     )
 
-    # Stash RAW activation for both actor training (scaled in
-    # _get_model_inputs_args) and critic training (scaled per mse_scale).
-    sample.multimodal_train_inputs = {MM_ACTIVATION_KEY: v_raw}
+    # Critic-training gold, stashed RAW (the loss applies mse_scale). Autoencoder:
+    # the injected vector itself. Transcoder: the TARGET-layer activation v_M
+    # (absolute) or the residual delta v_M − v_N (NLA_TRANSCODER_DELTA). v_raw was
+    # injected into the ACTOR above and stays the SOURCE; only the GOLD switches.
+    # reward.py recomputes the identical gold from metadata via the SAME
+    # transcoder_gold helper, so the reward path and this online-critic training
+    # path cannot drift (train_actor._assert_reward_train_paths_agree guards it).
+    target = sample.metadata.get(TARGET_ACTIVATION_COLUMN)
+    if target is not None:
+        target = torch.from_numpy(np.asarray(target, dtype=np.float32)).view(1, -1)
+    sample.multimodal_train_inputs = {
+        MM_ACTIVATION_KEY: transcoder_gold(v_raw, target, _DELTA)
+    }
 
     explanation = extract_explanation(sample.response)
 

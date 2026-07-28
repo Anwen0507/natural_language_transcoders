@@ -27,7 +27,10 @@ from miles.utils.processing_utils import load_tokenizer
 from miles.utils.types import Sample
 
 from nla.config import load_nla_config
-from nla.schema import extract_explanation, normalize_activation
+from nla.schema import (
+    TARGET_ACTIVATION_COLUMN, extract_explanation, normalize_activation,
+    transcoder_delta_mode, transcoder_gold,
+)
 
 
 _MSE_EPS = 1e-8
@@ -47,13 +50,14 @@ _TAIL_FLUSH_SECONDS = float(os.environ.get("NLA_REWARD_FLUSH_SECS", "5.0"))
 
 _TOKENIZER = None
 _CFG = None
+_DELTA = False  # transcoder delta mode (NLA_TRANSCODER_DELTA), set in _lazy_init
 
 _pending: list[tuple[Sample, asyncio.Future]] = []
 _drain_task: asyncio.Task | None = None
 
 
 def _lazy_init(args):
-    global _TOKENIZER, _CFG
+    global _TOKENIZER, _CFG, _DELTA
     if _TOKENIZER is not None:
         return
     # Tokenizer and sidecar from the critic's HF dir. FSDP: args.critic_load IS
@@ -72,6 +76,7 @@ def _lazy_init(args):
     assert _CFG.critic_prompt_template is not None, (
         f"critic sidecar at {sidecar_dir!r} has no critic_prompt_template"
     )
+    _DELTA = transcoder_delta_mode()
 
 
 def _prep_batch(samples: list[Sample]):
@@ -96,7 +101,15 @@ def _prep_batch(samples: list[Sample]):
         expl = extract_explanation(s.response)
         if expl is not None:
             prompts.append(_CFG.critic_prompt_template.format(explanation=expl))
-            golds.append(s.metadata["activation_vector"])
+            # Same gold the online critic trains against (set in nla_generate via
+            # transcoder_gold): target v_M for absolute, v_M − v_N for delta, or
+            # the lone activation for a plain autoencoder. Computed from raw numpy
+            # metadata; torch.tensor(golds) below stacks them.
+            golds.append(transcoder_gold(
+                s.metadata["activation_vector"],
+                s.metadata.get(TARGET_ACTIVATION_COLUMN),
+                _DELTA,
+            ))
             orig_idx.append(i)
     if not prompts:
         return None, []

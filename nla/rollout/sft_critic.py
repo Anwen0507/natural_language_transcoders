@@ -14,7 +14,9 @@ import torch
 from miles.utils.processing_utils import load_tokenizer
 
 from nla.config import load_nla_config, resolve_sidecar_source, verify_critic_suffix
-from nla.schema import MM_ACTIVATION_KEY
+from nla.schema import (
+    MM_ACTIVATION_KEY, TARGET_ACTIVATION_COLUMN, transcoder_delta_mode, transcoder_gold,
+)
 
 
 _TOKENIZER = None
@@ -39,6 +41,7 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         )
         _SUFFIX_IDS = cfg.critic_suffix_ids
 
+    delta = transcoder_delta_mode()
     samples = data_buffer.get_samples(args.rollout_batch_size)
 
     for group in samples:
@@ -67,9 +70,19 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         sample.reward = 0.0
         sample.loss_mask = []
 
-        activation = torch.tensor(
+        # Critic gold. Autoencoder (single-layer AR-SFT, no target column) → the
+        # one activation. Transcoder (paired AR-SFT) → the target v_M (absolute)
+        # or the residual delta v_M − v_N (NLA_TRANSCODER_DELTA). transcoder_gold
+        # collapses to the activation when target is None, so this is a no-op for
+        # ordinary autoencoder data.
+        source = torch.tensor(
             sample.metadata["activation_vector"], dtype=torch.float32
         ).view(1, -1)
-        sample.multimodal_train_inputs = {MM_ACTIVATION_KEY: activation}
+        target = sample.metadata.get(TARGET_ACTIVATION_COLUMN)
+        if target is not None:
+            target = torch.tensor(target, dtype=torch.float32).view(1, -1)
+        sample.multimodal_train_inputs = {
+            MM_ACTIVATION_KEY: transcoder_gold(source, target, delta)
+        }
 
     return samples

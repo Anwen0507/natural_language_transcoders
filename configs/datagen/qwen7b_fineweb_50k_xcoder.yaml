@@ -1,0 +1,53 @@
+# Transcoder RL-only datagen (N=16 -> M=20) from the released Qwen-7B NLA pair.
+# 50k train docs (+2k held-out eval docs via corpus.start override), 3
+# positions/doc -> ~150k train / ~6k eval paired rows. RL split only — no
+# stage-2 explainer, no API key: stage1 fracs 0/0/1, and stage-3/shuffle are
+# invoked directly for the rl split (run_pipeline's stage-3 also builds the
+# SFT splits, which would require stage-2 output).
+#
+# Driven by /storage/nla_datagen_xcoder7b.sh as four stage-0 passes:
+#   train N: (config as-is)                  -> .../xcoder7b/train/N
+#   train M: --override layer_index=20 output_dir=.../train/M
+#   eval  N: --override corpus.start=50000 corpus.length=2000 output_dir=.../eval/N
+#   eval  M: eval overrides + layer_index=20 -> .../eval/M
+# Same config+seed per doc range => per-doc keyed RNG samples identical
+# (doc_id, position) sets at N and M; eval docs are disjoint by corpus.start.
+base_model: Qwen/Qwen2.5-7B-Instruct
+layer_index: 16
+output_dir: /notebooks/nla_runs/xcoder7b/train/N
+
+corpus:
+  name: HuggingFaceFW/fineweb
+  config: sample-10BT
+  split: train
+  text_column: text
+  start: 0
+  length: 50000
+
+stage0:
+  positions_per_doc: 3
+  chunk_size: 256
+  seed: 42
+  multigpu: false
+  extractor_kwargs: {batch_size: 32, max_length: 2048}
+
+stage1:
+  av_sft_frac: 0.0
+  ar_sft_frac: 0.0
+  rl_frac: 1.0
+  seed: 42
+
+# stage2 unused (no SFT splits in this run) — kept for schema completeness.
+stage2:
+  provider_cls: nla.datagen.providers.OpenAICompatProvider
+  provider_kwargs: {model: unused, base_url: "http://127.0.0.1:1/v1"}
+  chunk_size: 512
+
+stage3:
+  keep_debug_metadata: true
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

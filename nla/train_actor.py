@@ -42,8 +42,8 @@ from nla.config import NLAConfig, load_nla_config_from_args, write_model_sidecar
 from nla.injection import inject_at_marked_positions
 from nla.models import NLACriticModel, embed_dump_path
 from nla.schema import (
-    MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY,
-    load_predict_mean_baselines, normalize_activation,
+    MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY, TARGET_ACTIVATION_COLUMN,
+    load_predict_mean_baselines, normalize_activation, transcoder_delta_mode,
 )
 from nla.storage import _load_storage, is_remote
 
@@ -408,7 +408,14 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 if is_remote(source):
                     assert args.nla_storage_cls is not None
                     source = _load_storage(args.nla_storage_cls).open_read(source)
-                _, b_rv = load_predict_mean_baselines(source, cfg.mse_scale)
+                # Transcoder: baseline on the GOLD the critic fits (target v_M, or
+                # delta v_M − v_N), not on activation_vector (= source v_N in
+                # paired data). Auto-detected — no-op for autoencoder parquets.
+                _, b_rv = load_predict_mean_baselines(
+                    source, cfg.mse_scale,
+                    target_column=TARGET_ACTIVATION_COLUMN,
+                    delta=transcoder_delta_mode(),
+                )
                 baselines[0] = b_rv
                 dt = time.perf_counter() - t0
                 print(f"[NLA] FVE baseline rawvar={b_rv:.4f} "

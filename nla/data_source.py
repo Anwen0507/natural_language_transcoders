@@ -26,7 +26,7 @@ from miles.utils.processing_utils import load_tokenizer
 from miles.utils.types import Sample
 
 from nla.config import load_nla_config, resolve_sidecar_source
-from nla.schema import INJECT_PLACEHOLDER
+from nla.schema import INJECT_PLACEHOLDER, TARGET_ACTIVATION_COLUMN
 from nla.storage import fetch_to_local_cache, is_remote
 
 
@@ -82,14 +82,24 @@ class NLADataSource(RolloutDataSource):
         pf = pq.ParquetFile(parquet_path)
         cols = pf.schema_arrow.names
         assert "activation_vector" in cols, f"parquet {parquet_path!r} missing activation_vector column"
-        other_cols = [c for c in cols if c != "activation_vector"]
+        # Transcoder paired parquets carry a SECOND wide vector column (the target
+        # layer's activation). Read it as numpy too — letting it fall into
+        # other_cols → to_pylist would recreate the millions-of-PyFloats GC stall
+        # the numpy path below exists to avoid.
+        has_target = TARGET_ACTIVATION_COLUMN in cols
+        vector_cols = {"activation_vector", TARGET_ACTIVATION_COLUMN}
+        other_cols = [c for c in cols if c not in vector_cols]
+
+        def _as_numpy(batch, name):
+            col = batch.column(name)
+            flat = col.flatten().to_numpy(zero_copy_only=False).astype(np.float32)
+            return flat.reshape(len(col), -1)
 
         samples = []
         for batch in pf.iter_batches(batch_size=16384):
             # activation_vector: ListArray → flat numpy → reshape. Zero Python objects.
-            av_col = batch.column("activation_vector")
-            av_flat = av_col.flatten().to_numpy(zero_copy_only=False).astype(np.float32)
-            av = av_flat.reshape(len(av_col), -1)
+            av = _as_numpy(batch, "activation_vector")
+            tv = _as_numpy(batch, TARGET_ACTIVATION_COLUMN) if has_target else None
             # other columns via to_pylist — small (prompts, strings, ints)
             rest = batch.select(other_cols).to_pylist()
 
@@ -110,6 +120,8 @@ class NLADataSource(RolloutDataSource):
                     )
 
                 sample_meta: dict[str, object] = {"activation_vector": vec}
+                if tv is not None:
+                    sample_meta[TARGET_ACTIVATION_COLUMN] = tv[i]
                 if "response" in row:
                     sample_meta["response"] = row["response"]
                 for k in ("n_raw_tokens", "detokenized_text_truncated",

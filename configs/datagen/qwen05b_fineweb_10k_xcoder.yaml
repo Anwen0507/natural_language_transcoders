@@ -1,0 +1,54 @@
+# Transcoder 0.5B run (layer 10 -> 14), SFT-only — single A100-80G, keyless
+# local explainer. Deviations from quick_test_10docs.yaml, with reasons:
+#   * corpus.length 10000 -> ~30k positions.
+#   * split 0.40/0.40/0.20 (quick_test mirrors the RL-heavy 7B recipe with
+#     0.25/0.25/0.50; this run has no RL consumer — the rl split serves only
+#     as identity-baseline + held-out round-trip eval, so feed SFT instead).
+#   * stage2 provider: local Qwen/Qwen2.5-14B-Instruct via `vllm serve` on
+#     :8000 through OpenAICompatProvider — no API key involved.
+#   * stage0 batch_size 32 (0.5B @ max_length 1024 on A100-80G).
+# The M=14 target-layer extraction reuses this config with
+#   --stages 0 --override output_dir=.../M layer_index=14
+# (same corpus/seed => per-doc keyed RNG samples identical positions).
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+layer_index: 10
+output_dir: /notebooks/nla_runs/xcoder05b/N
+
+corpus:
+  name: HuggingFaceFW/fineweb
+  config: sample-10BT
+  split: train
+  text_column: text
+  start: 0
+  length: 10000
+
+stage0:
+  positions_per_doc: 3
+  chunk_size: 1000
+  seed: 42
+  multigpu: false
+  extractor_kwargs: {batch_size: 32, max_length: 1024}
+
+stage1:
+  av_sft_frac: 0.40
+  ar_sft_frac: 0.40
+  rl_frac: 0.20
+  seed: 42
+
+stage2:
+  provider_cls: nla.datagen.providers.OpenAICompatProvider
+  provider_kwargs:
+    model: Qwen/Qwen2.5-14B-Instruct
+    base_url: http://127.0.0.1:8000/v1
+    concurrency: 32
+    max_tokens: 300
+  chunk_size: 512
+
+stage3:
+  keep_debug_metadata: true
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

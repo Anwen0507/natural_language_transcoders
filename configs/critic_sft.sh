@@ -5,6 +5,13 @@
 # Prerequisite: run nla.scripts.prepare_critic_checkpoint first to produce
 # CRITIC_INIT_CKPT — a truncated-K-layer checkpoint with config.json +
 # nla_meta.yaml. from_pretrained then loads K layers naturally (no arg needed).
+#
+# TRANSCODER (layer N → M): point AR_SFT_PARQUET at a stage_pair_target output
+# (activation_vector = v_N, target_activation_vector = v_M) and CRITIC_INIT_CKPT
+# at a checkpoint prepared with --num-layers M (the TARGET layer — its
+# last_hidden_state must live in layer-M space). Export NLA_TRANSCODER_DELTA=1 to
+# fit the residual delta (v_M − v_N) instead of the absolute v_M. The training
+# code is identical; only the gold differs. See docs/transcoder.md.
 
 : "${AR_SFT_PARQUET:?set AR_SFT_PARQUET to the Stage 3b parquet path}"
 : "${CRITIC_INIT_CKPT:?set CRITIC_INIT_CKPT to prepare_critic_checkpoint.py output dir}"

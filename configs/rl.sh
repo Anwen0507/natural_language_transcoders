@@ -12,6 +12,14 @@
 #
 # Prerequisite: ACTOR_SFT_CKPT and CRITIC_SL_CKPT must both have nla_meta.yaml
 # with matching token IDs / prompt templates.
+#
+# TRANSCODER (layer N → M): RL_PARQUET = a stage_pair_target output (carries both
+# v_N and v_M); CRITIC_SL_CKPT = a critic trained/truncated at the TARGET layer M.
+# `export NLA_TRANSCODER_DELTA=1` (exported, so the Ray rollout/reward/critic
+# workers all inherit it) to reconstruct the residual delta v_M − v_N rather than
+# the absolute v_M. The actor still injects v_N; only the critic gold changes, and
+# reward.py + nla_generate.py read the same flag so they can't diverge.
+# See docs/transcoder.md.
 
 : "${RL_PARQUET:?set RL_PARQUET to the Stage 3c parquet path}"
 : "${INSTRUCT_MODEL:?HF base instruct model (e.g. Qwen/Qwen2.5-7B-Instruct) — supplies tokenizer/config}"

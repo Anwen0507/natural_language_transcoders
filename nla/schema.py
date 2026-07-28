@@ -9,6 +9,7 @@ Two sidecar conventions:
 """
 
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,12 @@ def extract_explanation(response: str) -> str | None:
 
 # Parquet column name — datagen writes it, NLADataSource + rollouts read it.
 ACTIVATION_COLUMN = "activation_vector"
+
+# Transcoder target column — present ONLY in paired parquets (stage_pair_target).
+# Holds the RAW activation at the TARGET layer M, at the same (doc_id, position)
+# as activation_vector (which is then the SOURCE layer N the actor injects).
+# Absent ⇒ ordinary single-layer autoencoder data, classic behaviour everywhere.
+TARGET_ACTIVATION_COLUMN = "target_activation_vector"
 
 # Placeholder in parquet prompt column — datagen writes <INJECT> literal,
 # NLADataSource swaps it for the injection char at load time.
@@ -150,6 +157,43 @@ def normalize_activation(v: torch.Tensor, target_scale: float | None) -> torch.T
     return v / (norm_fp32 / target_scale).to(v.dtype)
 
 
+def transcoder_delta_mode() -> bool:
+    """True ⇒ the critic reconstructs the residual-stream DELTA (v_M − v_N)
+    rather than the absolute next-layer activation v_M. Toggled by the env var
+    NLA_TRANSCODER_DELTA=1.
+
+    Why an env var, not a CLI flag: the training entrypoint is miles' argparse
+    (upstream — we don't add flags there). The mode must read identically in four
+    processes — NLADataSource + nla_generate (RolloutManager), nla_rm (reward
+    worker), and the critic trainer's FVE baseline — so an EXPORTED env var
+    (inherited by every Ray worker) is the only thing guaranteed to reach all of
+    them. Routing every gold-producing site through this one helper is what keeps
+    the reward gold and the training gold identical; train_actor's step-0
+    _assert_reward_train_paths_agree would fire if they ever diverged.
+
+    Absolute (False) is the default and is bit-identical to the autoencoder.
+    """
+    return os.environ.get("NLA_TRANSCODER_DELTA", "0") == "1"
+
+
+def transcoder_gold(source, target, delta: bool):
+    """The critic's reconstruction target, derived from the source/target vectors.
+
+      target is None  → autoencoder: gold = source (the one extracted vector).
+      delta is False  → transcoder ABSOLUTE: gold = target            (v_M).
+      delta is True   → transcoder DELTA:    gold = target − source    (v_M − v_N);
+                        reconstruct v_M ≈ v_N + critic(text) at inference time.
+
+    Type-agnostic: `source` and `target` are both np.ndarray or both torch.Tensor
+    (each call site passes matching types). No normalization here — mse_scale is
+    applied symmetrically to pred and gold at loss/reward time, so DELTA inherits
+    the same direction-only (or raw, when mse_scale=null) treatment as ABSOLUTE.
+    """
+    if target is None:
+        return source
+    return (target - source) if delta else target
+
+
 def compute_predict_mean_baselines(
     vectors: torch.Tensor, mse_scale: float | None
 ) -> tuple[float, float]:
@@ -176,22 +220,41 @@ def compute_predict_mean_baselines(
 
 
 def load_predict_mean_baselines(
-    parquet_source: BinaryIO | str, mse_scale: float | None, max_rows: int = 50_000
+    parquet_source: BinaryIO | str, mse_scale: float | None, max_rows: int = 50_000,
+    *, target_column: str | None = None, delta: bool = False,
 ) -> tuple[float, float]:
     """Read activation_vector column from parquet, compute both baselines.
 
     max_rows caps memory — 50k × 3584 × fp32 ≈ 700MB. Sampling error on the
     variance estimate is O(1/√n) — tight at 50k.
+
+    Transcoder: when `target_column` is present in the parquet, the baseline is
+    computed on the GOLD the critic actually fits — target (v_M) for absolute, or
+    target−source (v_M−v_N) for delta — NOT on activation_vector, which is the
+    SOURCE v_N in paired data and would give a meaningless FVE denominator. The
+    column is auto-detected, so callers may pass target_column unconditionally;
+    autoencoder parquets (no target column) fall back to the source unchanged.
     """
     pf = pq.ParquetFile(parquet_source)
-    rows = []
-    n = 0
-    for batch in pf.iter_batches(batch_size=8192, columns=[ACTIVATION_COLUMN]):
+    use_target = target_column is not None and target_column in pf.schema_arrow.names
+    columns = [ACTIVATION_COLUMN] + ([target_column] if use_target else [])
+
+    def _reshape(batch, name):
         # ListArray → flat values → reshape. Avoids to_pylist() which creates
         # millions of PyFloat objects (same GC pressure we fixed in data_source).
-        col = batch.column(ACTIVATION_COLUMN)
+        col = batch.column(name)
         flat = col.flatten().to_numpy(zero_copy_only=False).astype(np.float32)
-        chunk = flat.reshape(len(col), -1)
+        return flat.reshape(len(col), -1)
+
+    rows = []
+    n = 0
+    for batch in pf.iter_batches(batch_size=8192, columns=columns):
+        src = _reshape(batch, ACTIVATION_COLUMN)
+        if use_target:
+            tgt = _reshape(batch, target_column)
+            chunk = (tgt - src) if delta else tgt
+        else:
+            chunk = src
         rows.append(chunk)
         n += chunk.shape[0]
         if n >= max_rows:
@@ -221,6 +284,7 @@ def compute_canonical_neighbors(
         [{"role": "user", "content": content}],
         tokenize=True,
         add_generation_prompt=True,
+        return_dict=False,  # transformers≥5: BatchEncoding otherwise
     )
     matches = [i for i, tid in enumerate(ids) if tid == injection_token_id]
     assert len(matches) == 1, (

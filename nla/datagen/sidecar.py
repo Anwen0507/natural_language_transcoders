@@ -35,6 +35,11 @@ class NLAExtractionMeta:
     corpus: str
     corpus_slice: dict[str, int]
     positions_per_doc: int
+    # Transcoder paired datasets only (stage_pair_target): the TARGET layer M
+    # whose activation lives in target_activation_vector. layer_index is then the
+    # SOURCE layer N (the vector the actor injects). None for ordinary single-
+    # layer datasets — kept last with a default so old sidecars still deserialize.
+    target_layer_index: int | None = None
 
 
 @dataclass
