@@ -567,9 +567,10 @@ class NLAFSDPActor(FSDPTrainRayActor):
     def _get_model_inputs_args(self, batch):
         mm = batch.get("multimodal_train_inputs")
         if mm is not None and MM_ACTIVATION_KEY in mm:
-            popped = mm.pop(MM_ACTIVATION_KEY)  # [B, d_model], raw from dataset
+            popped = mm.pop(MM_ACTIVATION_KEY)  # [B, d_model] SOURCE, raw from dataset
+            gold = mm.pop(MM_CRITIC_GOLD_KEY, None)  # transcoder: gold ≠ source
             if self._is_critic_model:
-                batch[MM_ACTIVATION_KEY] = popped
+                batch[MM_ACTIVATION_KEY] = popped if gold is None else gold
                 batch[MM_MSE_SCALE_KEY] = self._nla_cfg.mse_scale
             else:
                 self._nla_vectors = normalize_activation(popped, self._nla_cfg.injection_scale)

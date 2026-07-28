@@ -71,6 +71,11 @@ INJECT_PLACEHOLDER = "<INJECT>"
 # String typo here = silent KeyError deep in training.
 MM_ACTIVATION_KEY = "nla_activation"
 MM_CRITIC_TOKENS_KEY = "nla_critic_tokens"
+# Transcoder: the critic's regression gold (v_M, or v_M − v_N in delta mode)
+# differs from the actor's injected SOURCE vector. They must ride in separate
+# slots — MM_ACTIVATION_KEY feeds the actor injection AND (absent this key)
+# the critic gold, which is only correct when the two coincide (autoencoder).
+MM_CRITIC_GOLD_KEY = "nla_critic_gold"
 MM_MSE_SCALE_KEY = "nla_mse_scale"
 
 # Sentinel for extraction.{injection_scale, mse_scale} — resolve to sqrt(d_model)

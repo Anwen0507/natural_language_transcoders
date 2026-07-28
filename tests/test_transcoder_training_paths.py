@@ -125,8 +125,8 @@ import nla.reward as rw  # noqa: E402
 import nla.rollout.nla_generate as ng  # noqa: E402
 import nla.rollout.sft_critic as sc  # noqa: E402
 from nla.schema import (  # noqa: E402
-    ACTIVATION_COLUMN, MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY,
-    TARGET_ACTIVATION_COLUMN, normalize_activation,
+    ACTIVATION_COLUMN, MM_ACTIVATION_KEY, MM_CRITIC_GOLD_KEY,
+    MM_CRITIC_TOKENS_KEY, TARGET_ACTIVATION_COLUMN, normalize_activation,
 )
 
 # Force the deterministic transport/routing paths regardless of the outer env
@@ -450,7 +450,14 @@ def test_generate_injects_source_stashes_gold():
         out, cap, emb = _run_generate(delta, paired, resp)
         label = f"delta={delta} paired={paired}"
 
-        gold = out.multimodal_train_inputs[MM_ACTIVATION_KEY]
+        # MM_ACTIVATION_KEY feeds the actor's TRAIN-forward injection — it must
+        # be the raw SOURCE in every mode, or train-recomputed logprobs diverge
+        # from the rollout's. The gold rides in its own slot.
+        src = out.multimodal_train_inputs[MM_ACTIVATION_KEY]
+        assert src.shape == (1, D) and src.dtype == torch.float32, label
+        assert torch.allclose(src, torch.from_numpy(SRC[0]).view(1, -1)), (
+            f"train-side injection stash must be the raw SOURCE for {label}")
+        gold = out.multimodal_train_inputs[MM_CRITIC_GOLD_KEY]
         assert gold.shape == (1, D) and gold.dtype == torch.float32, label
         assert torch.allclose(gold, torch.from_numpy(expected).view(1, -1)), (
             f"wrong critic gold for {label}")
@@ -476,7 +483,7 @@ def test_generate_extraction_miss_fails_after_gold():
     still happens first (harmless — the critic-token filter drops the sample)."""
     out, cap, _ = _run_generate(True, True, "no tags at all")
     assert out.status == Sample.Status.FAILED
-    gold = out.multimodal_train_inputs[MM_ACTIVATION_KEY]
+    gold = out.multimodal_train_inputs[MM_CRITIC_GOLD_KEY]
     assert torch.allclose(gold, torch.from_numpy(TGT[0] - SRC[0]).view(1, -1))
     assert MM_CRITIC_TOKENS_KEY not in out.multimodal_train_inputs
 

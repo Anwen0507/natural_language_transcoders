@@ -42,7 +42,7 @@ from nla.config import load_nla_config_from_args
 from nla.injection import inject_at_marked_positions
 from nla.models import embed_dump_path, load_embedding_only
 from nla.schema import (
-    MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, TARGET_ACTIVATION_COLUMN,
+    MM_ACTIVATION_KEY, MM_CRITIC_GOLD_KEY, MM_CRITIC_TOKENS_KEY, TARGET_ACTIVATION_COLUMN,
     extract_explanation, normalize_activation, transcoder_delta_mode, transcoder_gold,
 )
 
@@ -353,18 +353,21 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         args, sample, payload={"input_ids": input_ids}, output=output
     )
 
-    # Critic-training gold, stashed RAW (the loss applies mse_scale). Autoencoder:
-    # the injected vector itself. Transcoder: the TARGET-layer activation v_M
-    # (absolute) or the residual delta v_M − v_N (NLA_TRANSCODER_DELTA). v_raw was
-    # injected into the ACTOR above and stays the SOURCE; only the GOLD switches.
-    # reward.py recomputes the identical gold from metadata via the SAME
-    # transcoder_gold helper, so the reward path and this online-critic training
-    # path cannot drift (train_actor._assert_reward_train_paths_agree guards it).
+    # Two RAW stashes with distinct consumers (the loss applies mse_scale):
+    # MM_ACTIVATION_KEY = the SOURCE vector v_raw — the actor's train-forward
+    # re-injects it, and it MUST match what the rollout injected above or the
+    # recomputed logprobs diverge from the rollout's (importance ratios become
+    # noise). MM_CRITIC_GOLD_KEY = the critic-training gold: the vector itself
+    # (autoencoder), the target-layer v_M (transcoder absolute), or v_M − v_N
+    # (NLA_TRANSCODER_DELTA). reward.py recomputes the identical gold from
+    # metadata via the same transcoder_gold helper, so reward and critic-train
+    # cannot drift (train_actor._assert_reward_train_paths_agree guards it).
     target = sample.metadata.get(TARGET_ACTIVATION_COLUMN)
     if target is not None:
         target = torch.from_numpy(np.asarray(target, dtype=np.float32)).view(1, -1)
     sample.multimodal_train_inputs = {
-        MM_ACTIVATION_KEY: transcoder_gold(v_raw, target, _DELTA)
+        MM_ACTIVATION_KEY: v_raw,
+        MM_CRITIC_GOLD_KEY: transcoder_gold(v_raw, target, _DELTA),
     }
 
     explanation = extract_explanation(sample.response)
