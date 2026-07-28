@@ -114,7 +114,9 @@ tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
 m = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct",
         torch_dtype=torch.bfloat16, device_map="cuda")
 ids = tok("The quick brown fox jumps over the lazy dog.", return_tensors="pt").to("cuda")
-hs = m(**ids, output_hidden_states=True).hidden_states[20][0]  # [seq, 3584]
+hs = m(**ids, output_hidden_states=True).hidden_states[21][0]  # [seq, 3584]
+# hidden_states[21], not [20]: the pipeline's layer_index=20 hooks the OUTPUT of
+# model.layers[20], which is hidden_states[K+1] (index 0 is the embeddings).
 pq.write_table(pa.table({"activation_vector": hs.float().cpu().tolist()}), "demo.parquet")
 ```
 

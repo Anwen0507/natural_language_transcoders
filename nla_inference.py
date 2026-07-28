@@ -184,9 +184,11 @@ def load_nla_config(
     # apply_chat_template(tokenize=True) handles BOS correctly for all
     # architectures (Gemma template includes <bos>; Qwen has none).
     content = cfg.actor_prompt_template.format(injection_char=cfg.injection_char)
+    # return_dict=False: transformers≥5 otherwise returns a BatchEncoding here,
+    # and iterating it yields dict keys, not token ids.
     ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": content}],
-        tokenize=True, add_generation_prompt=True,
+        tokenize=True, add_generation_prompt=True, return_dict=False,
     )
     matches = [i for i, tok in enumerate(ids) if tok == cfg.injection_token_id]
     assert len(matches) == 1, (
@@ -403,6 +405,7 @@ class NLAClient:
         input_ids = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": content}],
             tokenize=True, add_generation_prompt=True,
+            return_dict=False,  # transformers≥5: BatchEncoding otherwise
         )
         ids_t = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
 
