@@ -80,7 +80,16 @@ def _swap_rollout_to_critic_tokens(rollout_data: dict, device: torch.device) -> 
         "response_lengths": [0] * len(critic_tokens),
         "loss_masks": [empty_mask] * len(critic_tokens),
         "multimodal_train_inputs": [
-            {MM_ACTIVATION_KEY: mm_list[i][MM_ACTIVATION_KEY]} for i in kept
+            {
+                MM_ACTIVATION_KEY: mm_list[i][MM_ACTIVATION_KEY],
+                # Transcoder: the critic's regression gold rides in its own
+                # slot and must survive the repack. Absent (SFT producers /
+                # autoencoder data) the consumer falls back to the source.
+                MM_CRITIC_GOLD_KEY: mm_list[i].get(
+                    MM_CRITIC_GOLD_KEY, mm_list[i][MM_ACTIVATION_KEY]
+                ),
+            }
+            for i in kept
         ],
     }
 
@@ -100,7 +109,11 @@ def _assert_reward_train_paths_agree(
     """
     mm_list = rollout_data["multimodal_train_inputs"]
     toks = [mm[MM_CRITIC_TOKENS_KEY] for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm]
-    golds = torch.cat([mm[MM_ACTIVATION_KEY] for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm], dim=0)
+    golds = torch.cat(
+        [mm.get(MM_CRITIC_GOLD_KEY, mm[MM_ACTIVATION_KEY])
+         for mm in mm_list if mm and MM_CRITIC_TOKENS_KEY in mm],
+        dim=0,
+    )
     # Two paths must agree on ANY subset — a handful of varied-length samples
     # exercises padding edge cases; 32 from the rank-partition adds ~1s.
     # critic_fwd returns .cpu() but rollout_data's golds are on the rank's

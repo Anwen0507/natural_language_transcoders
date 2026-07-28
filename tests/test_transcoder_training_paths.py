@@ -118,6 +118,27 @@ _miles.utils.processing_utils = _mod("miles.utils.processing_utils",
                                      load_tokenizer=_unpatched("load_tokenizer"))
 _miles.utils.http_utils = _mod("miles.utils.http_utils", post=_unpatched("post"))
 _miles.utils.types = _mod("miles.utils.types", Sample=Sample)
+# train_actor's import surface (for _swap_rollout_to_critic_tokens tests).
+# timer is a runtime context manager here (no import-time decorators) — inert
+# stubs suffice; anything actually called must be monkeypatched by the test.
+_miles.utils.ray_utils = _mod("miles.utils.ray_utils", Box=object)
+_miles.utils.timer = _mod("miles.utils.timer", timer=_unpatched("timer"))
+_miles.backends = _mod("miles.backends")
+_miles.backends.fsdp_utils = _mod("miles.backends.fsdp_utils")
+_miles.backends.fsdp_utils.actor = _mod(
+    "miles.backends.fsdp_utils.actor",
+    FSDPTrainRayActor=type("FSDPTrainRayActor", (), {}),
+    apply_fsdp2=_unpatched("apply_fsdp2"))
+_miles.backends.training_utils = _mod("miles.backends.training_utils")
+_miles.backends.training_utils.data = _mod(
+    "miles.backends.training_utils.data", get_batch=_unpatched("get_batch"))
+_miles.backends.training_utils.log_utils = _mod(
+    "miles.backends.training_utils.log_utils",
+    aggregate_forward_results=_unpatched("aggregate_forward_results"))
+_miles.backends.training_utils.loss = _mod(
+    "miles.backends.training_utils.loss",
+    get_log_probs_and_entropy=_unpatched("get_log_probs_and_entropy"),
+    loss_function=_unpatched("loss_function"))
 _mod("ray")
 
 import nla.data_source as nds  # noqa: E402
@@ -536,3 +557,27 @@ if __name__ == "__main__":
         fn()
         print(f"PASS  {fn.__name__}")
     print(f"\nall {len(tests)} training-path unit tests passed")
+
+
+def test_swap_repack_preserves_critic_gold():
+    """Regression: the transcoder gold must survive the critic-role repack.
+
+    _swap_rollout_to_critic_tokens once rebuilt mm dicts with only
+    MM_ACTIVATION_KEY (the SOURCE after the two-slot split) — the consumer's
+    fallback then silently trained the critic toward v_N instead of v_M.
+    """
+    from nla.train_actor import _swap_rollout_to_critic_tokens
+    src = torch.from_numpy(SRC[0]).view(1, -1)
+    gold = torch.from_numpy(TGT[0]).view(1, -1)
+    tok = torch.tensor([1, 2, 3])
+    rollout_data = {"multimodal_train_inputs": [
+        {MM_ACTIVATION_KEY: src, MM_CRITIC_GOLD_KEY: gold, MM_CRITIC_TOKENS_KEY: tok},
+        {MM_ACTIVATION_KEY: src, MM_CRITIC_TOKENS_KEY: tok},  # autoencoder-style mm
+        None,                                                  # failed extraction
+    ]}
+    out = _swap_rollout_to_critic_tokens(rollout_data, torch.device("cpu"))
+    mms = out["multimodal_train_inputs"]
+    assert len(mms) == 2
+    assert torch.allclose(mms[0][MM_CRITIC_GOLD_KEY], gold), "gold dropped in repack"
+    assert torch.allclose(mms[0][MM_ACTIVATION_KEY], src)
+    assert torch.allclose(mms[1][MM_CRITIC_GOLD_KEY], src), "fallback must equal source"
