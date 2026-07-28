@@ -293,6 +293,7 @@ class NLAFSDPActor(FSDPTrainRayActor):
         self._is_critic_model = getattr(args, "nla_model_is_critic", False)
 
         rollout_id = super().init(args, role, with_ref)
+        self._install_nonfinite_grad_guard()
 
         # Parent keeps the full wrapper config (needs .vision_config for its own
         # checks); NLA only cares about text-side hidden_size/num_hidden_layers.
@@ -466,6 +467,47 @@ class NLAFSDPActor(FSDPTrainRayActor):
         # rewards, not critic values. Both groups consume the same rollout_data_ref;
         # nothing to sync.
         pass
+
+    def _install_nonfinite_grad_guard(self):
+        """Skip optimizer steps whose gradients contain inf/nan.
+
+        The critic backward occasionally emits non-finite grads (data-dependent;
+        observed on H100 under both flash-attn and sdpa, onset varying with the
+        stochastic rollout batch). Upstream clips then steps unconditionally —
+        clip_grad_norm_ turns a nan total-norm into all-nan grads, the step
+        poisons the weights, and the next weight sync kills the rollout engines
+        with sampler asserts. Skipping loses one batch instead. The skip
+        decision is all-reduced (MAX) so FSDP ranks cannot diverge.
+        """
+        opt = self.optimizer
+        orig_step = opt.step
+        self._nonfinite_skips = 0
+
+        def _guarded_step(*step_args, **step_kwargs):
+            bad = torch.zeros(1, device=torch.cuda.current_device())
+            for group in opt.param_groups:
+                for p in group["params"]:
+                    g = p.grad
+                    if g is None:
+                        continue
+                    if isinstance(g, DTensor):
+                        g = g.to_local()
+                    if not torch.isfinite(g).all():
+                        bad += 1
+                        break
+                if bad.item():
+                    break
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+            if bad.item():
+                self._nonfinite_skips += 1
+                opt.zero_grad(set_to_none=True)
+                if dist.get_rank() == 0:
+                    print(f"[NLA GRAD GUARD] non-finite grads — skipping optimizer "
+                          f"step (total skips: {self._nonfinite_skips})", flush=True)
+                return None
+            return orig_step(*step_args, **step_kwargs)
+
+        opt.step = _guarded_step
 
     def update_weights(self):
         """Sync actor weights to SGLang, then dump embedding for nla_generate.
