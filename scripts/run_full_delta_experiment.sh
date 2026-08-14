@@ -23,6 +23,9 @@ printf '{"started_at":"%s","start_epoch":%s,"pid":%s}\n' \
 
 on_exit() {
   code=$?
+  if [[ -n "${DELTA_NLA_TEACHER_SERVER_CONTAINER:-}" ]]; then
+    docker stop "$DELTA_NLA_TEACHER_SERVER_CONTAINER" >/dev/null 2>&1 || true
+  fi
   end_epoch="$(date +%s)"
   printf '{"finished_at":"%s","exit_code":%s,"elapsed_seconds":%s}\n' \
     "$(date --iso-8601=seconds)" "$code" "$((end_epoch-start_epoch))" > "$STATUS_DIR/exit.json"
@@ -55,6 +58,9 @@ run_stage() {
 run_stage extract -m delta_nla.extract --config "$CONFIG"
 run_stage stats -m delta_nla.stats --config "$CONFIG"
 run_stage teacher -m delta_nla.teacher --config "$CONFIG"
+if [[ -n "${DELTA_NLA_TEACHER_SERVER_CONTAINER:-}" ]]; then
+  docker stop "$DELTA_NLA_TEACHER_SERVER_CONTAINER" >/dev/null 2>&1 || true
+fi
 run_stage sft_ar -m delta_nla.sft --config "$CONFIG" --role ar
 run_stage sft_av -m delta_nla.sft --config "$CONFIG" --role av
 run_stage rl -m delta_nla.rl --config "$CONFIG"

@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+import re
 
 import numpy as np
 import pyarrow as pa
@@ -101,3 +102,83 @@ def test_teacher_batch_retries_only_invalid_outputs(monkeypatch):
     assert explanations[0] == "- first valid point\n- second valid point"
     assert explanations[1] == "- corrected first point\n- corrected second point"
     assert raw[1].startswith("<explanation>")
+
+
+def test_remote_teacher_runtime_requires_endpoint(monkeypatch):
+    monkeypatch.setenv("DELTA_NLA_TEACHER_BACKEND", "openai_compat")
+    monkeypatch.delenv("DELTA_NLA_TEACHER_BASE_URL", raising=False)
+    cfg = {
+        "models": {"teacher": "local", "teacher_revision": "main"},
+    }
+    try:
+        teacher._teacher_runtime(cfg)
+    except ValueError as exc:
+        assert "BASE_URL" in str(exc)
+    else:
+        raise AssertionError("remote teacher without an endpoint was accepted")
+
+
+def test_remote_prompt_forbids_visible_reasoning():
+    prompt = teacher._remote_prompt("diagnostics", retry=0)
+    assert "diagnostics" in prompt
+    assert "Do not reveal reasoning" in prompt
+    assert "Begin immediately with <explanation>" in prompt
+
+
+def test_remote_logit_bias_validation(monkeypatch):
+    monkeypatch.setenv(
+        "DELTA_NLA_TEACHER_LOGIT_BIAS_JSON", '{"47502": -100, "18927": -75}'
+    )
+    assert teacher._remote_logit_bias() == {"47502": -100.0, "18927": -75.0}
+
+    monkeypatch.setenv("DELTA_NLA_TEACHER_LOGIT_BIAS_JSON", "[]")
+    try:
+        teacher._remote_logit_bias()
+    except ValueError as exc:
+        assert "JSON object" in str(exc)
+    else:
+        raise AssertionError("non-object logit bias was accepted")
+
+
+def test_remote_teacher_retries_forbidden_terms(monkeypatch):
+    calls = []
+
+    def fake_generate(_model, _processor, prompts, _cfg, retry):
+        calls.append((list(prompts), retry))
+        if retry == 0:
+            return [
+                "<explanation>\n- strengthens the probability of a noun ending next"
+                "\n- suppresses an unrelated punctuation continuation now\n</explanation>"
+            ]
+        return [
+            "<explanation>\n- strengthens a likely noun ending as the next token"
+            "\n- suppresses an unrelated punctuation continuation now\n</explanation>"
+        ]
+
+    monkeypatch.setenv("DELTA_NLA_TEACHER_BACKEND", "openai_compat")
+    monkeypatch.setattr(teacher, "_generate_resilient", fake_generate)
+    cfg = {"teacher": {"max_retries": 2}}
+    _, explanations, valid, attempts = teacher._label_prompts(
+        object(), object(), ["prompt"], cfg
+    )
+
+    assert calls == [(["prompt"], 0), (["prompt"], 1)]
+    assert valid == [True]
+    assert attempts == [2]
+    assert not teacher._has_forbidden_explanation_terms(explanations[0])
+
+
+def test_guided_explanation_regex_enforces_bullet_word_count():
+    valid = (
+        "<explanation>\n"
+        "- one two three four five six seven eight nine ten\n"
+        "- one two three four five six seven eight nine ten eleven\n"
+        "</explanation>"
+    )
+    too_short = valid.replace(
+        "one two three four five six seven eight nine ten\n",
+        "one two three four five six seven eight nine\n",
+        1,
+    )
+    assert re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, valid)
+    assert not re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, too_short)
