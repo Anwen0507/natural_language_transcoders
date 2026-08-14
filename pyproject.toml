@@ -20,6 +20,7 @@ dependencies = [
     "pyarrow",
     "datasets",
     "anthropic",
+    "tqdm",
 ]
 # NOT pip-installable here — install separately per docs/setup.md:
 #   miles    : git clone radixark/miles, build_conda.sh, then git apply nla/miles_patches/*.patch
@@ -30,7 +31,7 @@ dependencies = [
 Homepage = "https://github.com/kitft/natural_language_autoencoders"
 
 [tool.setuptools.packages.find]
-include = ["nla*"]
+include = ["nla*", "delta_nla*"]
 
 [tool.setuptools.package-data]
 nla = ["miles_patches/*", "datagen/*.yaml"]
