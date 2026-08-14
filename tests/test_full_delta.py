@@ -125,6 +125,10 @@ def test_remote_prompt_forbids_visible_reasoning():
     assert "Do not reveal reasoning" in prompt
     assert "Begin immediately with <explanation>" in prompt
 
+    retry_prompt = teacher._remote_prompt("diagnostics", retry=1)
+    assert "exactly 2 hyphen bullets" in retry_prompt
+    assert "10-18 words per bullet" in retry_prompt
+
 
 def test_remote_logit_bias_validation(monkeypatch):
     monkeypatch.setenv(
@@ -200,6 +204,19 @@ def test_remote_max_in_flight_uses_rolling_limit(monkeypatch):
     monkeypatch.setenv("DELTA_NLA_TEACHER_MAX_IN_FLIGHT", "48")
     assert teacher._remote_max_in_flight(256) == 48
     assert teacher._remote_max_in_flight(32) == 32
+
+
+def test_remote_retries_receive_more_generation_room(monkeypatch):
+    cfg = {"teacher": {"max_new_tokens": 128}}
+    assert [teacher._remote_max_tokens(cfg, retry) for retry in range(4)] == [
+        128,
+        192,
+        256,
+        320,
+    ]
+
+    monkeypatch.setenv("DELTA_NLA_TEACHER_RETRY_TOKEN_INCREMENT", "32")
+    assert teacher._remote_max_tokens(cfg, 3) == 224
 
 
 def test_guided_explanation_regex_enforces_bullet_word_count():

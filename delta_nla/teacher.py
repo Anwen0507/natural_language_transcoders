@@ -93,8 +93,10 @@ def _teacher_runtime(cfg: dict[str, Any]) -> dict[str, str]:
 def _remote_prompt(prompt: str, retry: int) -> str:
     correction = (
         "\n\nFORMAT OR CONTENT CORRECTION: Your prior answer was unusable. "
-        "Output only <explanation> followed by 2-3 hyphen bullets and "
-        "</explanation>, and paraphrase any forbidden technical terms."
+        "Output only <explanation> followed by exactly 2 hyphen bullets and "
+        "</explanation>. Use 10-18 words per bullet, mention at most five "
+        "literal token candidates per bullet, and paraphrase any forbidden "
+        "technical terms."
     )
     return (
         f"{TEACHER_SYSTEM_PROMPT}\n\n{prompt}"
@@ -144,6 +146,22 @@ def _remote_max_in_flight(prompt_count: int) -> int:
     return min(value, max(prompt_count, 1))
 
 
+def _remote_max_tokens(cfg: dict[str, Any], retry: int) -> int:
+    """Give rare retries more room without slowing valid first attempts."""
+    base = int(
+        os.environ.get(
+            "DELTA_NLA_TEACHER_MAX_NEW_TOKENS",
+            str(cfg["teacher"]["max_new_tokens"]),
+        )
+    )
+    retry_increment = int(
+        os.environ.get("DELTA_NLA_TEACHER_RETRY_TOKEN_INCREMENT", "64")
+    )
+    if base <= 0 or retry_increment < 0:
+        raise ValueError("teacher token limits must be positive and nonnegative")
+    return base + retry * retry_increment
+
+
 def _generate_openai_batch(
     prompts: Sequence[str], cfg: dict[str, Any], retry: int
 ) -> list[str]:
@@ -161,7 +179,7 @@ def _generate_openai_batch(
         value: dict[str, Any] = {
             "model": runtime["model"],
             "messages": [{"role": "user", "content": _remote_prompt(prompt, retry)}],
-            "max_tokens": int(cfg["teacher"]["max_new_tokens"]),
+            "max_tokens": _remote_max_tokens(cfg, retry),
             "temperature": (
                 max(float(cfg["teacher"]["temperature"]), 0.2)
                 if do_sample
