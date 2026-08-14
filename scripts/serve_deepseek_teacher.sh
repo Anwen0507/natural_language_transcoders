@@ -5,6 +5,12 @@ IMAGE="${DEEPSEEK_VLLM_IMAGE:-vllm/vllm-openai:v0.8.5}"
 MODEL_DIR="${DEEPSEEK_MODEL_DIR:-/home/paperspace/models/DeepSeek-R1-Distill-Qwen-32B-AWQ-1de6a3f}"
 CONTAINER="${DEEPSEEK_CONTAINER_NAME:-delta-nla-deepseek-teacher}"
 PORT="${DEEPSEEK_PORT:-8000}"
+PREFIX_CACHING_ARGS=()
+if [[ "${DEEPSEEK_ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
+  PREFIX_CACHING_ARGS+=(--enable-prefix-caching)
+else
+  PREFIX_CACHING_ARGS+=(--no-enable-prefix-caching)
+fi
 
 if [[ ! -f "$MODEL_DIR/model.safetensors.index.json" ]]; then
   echo "DeepSeek checkpoint is incomplete under $MODEL_DIR" >&2
@@ -28,7 +34,8 @@ exec docker run --rm --name "$CONTAINER" \
   --max-model-len 8192 \
   --gpu-memory-utilization 0.92 \
   --max-num-seqs 64 \
-  --enable-prefix-caching \
+  "${PREFIX_CACHING_ARGS[@]}" \
+  --disable-log-requests \
   --generation-config vllm \
   --host 0.0.0.0 \
   --port 8000

@@ -33,6 +33,7 @@ from delta_nla.prompts import (
     TEACHER_SYSTEM_PROMPT,
     parse_explanation,
     teacher_prompt,
+    wrap_explanation,
 )
 
 
@@ -51,6 +52,19 @@ GUIDED_EXPLANATION_REGEX = (
 _FORBIDDEN_EXPLANATION_TERMS = re.compile(
     r"\b(?:logits?|probabilit(?:y|ies)|entropy|vectors?|probes?|diagnostics?)\b",
     flags=re.IGNORECASE,
+)
+_PLAIN_LANGUAGE_REPLACEMENTS = (
+    (re.compile(r"\blogit scores?\b", re.IGNORECASE), "candidate support"),
+    (re.compile(r"\bdiagnostic numbers?\b", re.IGNORECASE), "reported values"),
+    (re.compile(r"\blogits?\b", re.IGNORECASE), "scores"),
+    (re.compile(r"\bprobability\b", re.IGNORECASE), "likelihood"),
+    (re.compile(r"\bprobabilities\b", re.IGNORECASE), "likelihoods"),
+    (re.compile(r"\bentropy\b", re.IGNORECASE), "uncertainty"),
+    (re.compile(r"\bvectors\b", re.IGNORECASE), "representations"),
+    (re.compile(r"\bvector\b", re.IGNORECASE), "representation"),
+    (re.compile(r"\bprobes\b", re.IGNORECASE), "readouts"),
+    (re.compile(r"\bprobe\b", re.IGNORECASE), "readout"),
+    (re.compile(r"\bdiagnostics?\b", re.IGNORECASE), "evidence"),
 )
 
 
@@ -99,6 +113,14 @@ def _has_forbidden_explanation_terms(explanation: str) -> bool:
     return _FORBIDDEN_EXPLANATION_TERMS.search(explanation) is not None
 
 
+def _sanitize_forbidden_explanation_terms(explanation: str) -> str:
+    """Paraphrase rare exhausted content violations without changing structure."""
+    result = explanation
+    for pattern, replacement in _PLAIN_LANGUAGE_REPLACEMENTS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
 def _remote_logit_bias() -> dict[str, float]:
     """Parse an optional model-specific token ban for the serving backend."""
     raw = os.environ.get("DELTA_NLA_TEACHER_LOGIT_BIAS_JSON", "").strip()
@@ -108,6 +130,18 @@ def _remote_logit_bias() -> dict[str, float]:
     if not isinstance(parsed, Mapping):
         raise ValueError("DELTA_NLA_TEACHER_LOGIT_BIAS_JSON must be a JSON object")
     return {str(int(token_id)): float(bias) for token_id, bias in parsed.items()}
+
+
+def _remote_max_in_flight(prompt_count: int) -> int:
+    """Bound concurrent HTTP requests while allowing a larger rolling window."""
+    configured = os.environ.get(
+        "DELTA_NLA_TEACHER_MAX_IN_FLIGHT",
+        os.environ.get("DELTA_NLA_TEACHER_BATCH_SIZE", str(prompt_count)),
+    )
+    value = int(configured)
+    if value <= 0:
+        raise ValueError("teacher max in-flight requests must be positive")
+    return min(value, max(prompt_count, 1))
 
 
 def _generate_openai_batch(
@@ -121,6 +155,7 @@ def _generate_openai_batch(
     guided = os.environ.get("DELTA_NLA_TEACHER_GUIDED_REGEX", "0") == "1"
     do_sample = bool(cfg["teacher"]["do_sample"]) or retry > 0
     logit_bias = _remote_logit_bias()
+    max_in_flight = _remote_max_in_flight(len(prompts))
 
     def payload(prompt: str) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -144,8 +179,8 @@ def _generate_openai_batch(
         return value
 
     limits = httpx.Limits(
-        max_connections=max(len(prompts), 1),
-        max_keepalive_connections=max(len(prompts), 1),
+        max_connections=max_in_flight,
+        max_keepalive_connections=max_in_flight,
     )
     timeout = httpx.Timeout(timeout_seconds, connect=30.0)
     with httpx.Client(timeout=timeout, limits=limits) as client:
@@ -166,7 +201,7 @@ def _generate_openai_batch(
             body = response.json()
             return str(body["choices"][0]["message"]["content"] or "").strip()
 
-        with ThreadPoolExecutor(max_workers=max(len(prompts), 1)) as executor:
+        with ThreadPoolExecutor(max_workers=max_in_flight) as executor:
             return list(executor.map(generate_one, prompts))
 
 
@@ -311,12 +346,13 @@ def _label_prompts(
     processor,
     prompts: Sequence[str],
     cfg: dict[str, Any],
-) -> tuple[list[str], list[str], list[bool], list[int]]:
+) -> tuple[list[str], list[str], list[bool], list[int], list[bool]]:
     """Generate a batch, retrying only responses that violate the contract."""
     raw = [""] * len(prompts)
     explanations = [""] * len(prompts)
     valid = [False] * len(prompts)
     attempts = [0] * len(prompts)
+    sanitized = [False] * len(prompts)
     for retry in range(int(cfg["teacher"]["max_retries"])):
         pending = [index for index, is_valid in enumerate(valid) if not is_valid]
         if not pending:
@@ -343,7 +379,27 @@ def _label_prompts(
                 and _has_forbidden_explanation_terms(explanations[index])
             ):
                 valid[index] = False
-    return raw, explanations, valid, attempts
+    # A forbidden vocabulary term is a style violation, not a reason to discard
+    # an otherwise grounded, structurally valid label or terminate a long run.
+    # Preserve the original response in raw_output and sanitize only the SFT text.
+    if os.environ.get("DELTA_NLA_TEACHER_BACKEND", "transformers") == "openai_compat":
+        guided = os.environ.get("DELTA_NLA_TEACHER_GUIDED_REGEX", "0") == "1"
+        for index, is_valid in enumerate(valid):
+            if is_valid:
+                continue
+            parsed, format_valid = parse_explanation(raw[index])
+            if not format_valid or not _has_forbidden_explanation_terms(parsed):
+                continue
+            candidate = _sanitize_forbidden_explanation_terms(parsed)
+            candidate_raw = wrap_explanation(candidate)
+            if _has_forbidden_explanation_terms(candidate):
+                continue
+            if guided and re.fullmatch(GUIDED_EXPLANATION_REGEX, candidate_raw) is None:
+                continue
+            explanations[index] = candidate
+            valid[index] = True
+            sanitized[index] = True
+    return raw, explanations, valid, attempts, sanitized
 
 
 def _load_teacher(cfg: dict[str, Any]):
@@ -390,6 +446,16 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
     )
     if batch_size <= 0:
         raise ValueError("effective teacher batch size must be positive")
+    sort_window = batch_size * 8
+    rolling_queue = (
+        runtime["backend"] == "openai_compat"
+        and os.environ.get("DELTA_NLA_TEACHER_ROLLING_QUEUE", "0") == "1"
+    )
+    request_window = int(
+        os.environ.get("DELTA_NLA_TEACHER_REQUEST_WINDOW", str(sort_window))
+    )
+    if request_window < batch_size:
+        raise ValueError("teacher request window cannot be smaller than batch size")
     print(json.dumps({
         "teacher_runtime": {
             "backend": runtime["backend"],
@@ -397,7 +463,14 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
             "revision": runtime["revision"],
             "configured_batch_size": configured_batch_size,
             "effective_batch_size": batch_size,
-            "length_sort_window": batch_size * 8,
+            "length_sort_window": sort_window,
+            "rolling_queue": rolling_queue,
+            "request_window": request_window,
+            "max_in_flight": _remote_max_in_flight(
+                request_window if rolling_queue else batch_size
+            )
+            if runtime["backend"] == "openai_compat"
+            else None,
             "guided_regex": os.environ.get(
                 "DELTA_NLA_TEACHER_GUIDED_REGEX", "0"
             )
@@ -427,6 +500,7 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
             ("teacher_backend", pa.string()),
             ("teacher_prompt_sha256", pa.string()),
             ("teacher_code_revision", pa.string()),
+            ("content_sanitized", pa.bool_()),
         ]))
         atomic_write_table(
             table,
@@ -454,7 +528,6 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
         source = _rows(cfg["run_dir"], completed)
         # Sorting a small window by prompt length limits padding/KV-cache waste
         # while retaining bounded memory and resumability by row ID.
-        sort_window = batch_size * 8
         while attempted < remaining_total:
             window = list(
                 itertools.islice(
@@ -473,17 +546,18 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
                     (row, teacher_prompt(row["context"], diagnostics))
                 )
             prepared.sort(key=lambda item: len(item[1]))
-            for offset in range(0, len(prepared), batch_size):
-                current = prepared[offset : offset + batch_size]
+            generation_group_size = request_window if rolling_queue else batch_size
+            for offset in range(0, len(prepared), generation_group_size):
+                current = prepared[offset : offset + generation_group_size]
                 prompts = [prompt for _, prompt in current]
-                raw, explanations, valid, attempts = _label_prompts(
+                raw, explanations, valid, attempts, sanitized = _label_prompts(
                     model, processor, prompts, cfg
                 )
                 if not all(valid):
                     failed = valid.index(False)
                     row = current[failed][0]
                     raise RuntimeError(
-                        "teacher failed the strict explanation format after "
+                        "teacher failed the strict explanation contract after "
                         f"{attempts[failed]} attempts for row_id={row['row_id']}; "
                         f"last output={raw[failed][:500]!r}"
                     )
@@ -500,6 +574,7 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
                         "teacher_backend": runtime["backend"],
                         "teacher_prompt_sha256": prompt_sha256,
                         "teacher_code_revision": code_revision,
+                        "content_sanitized": sanitized[index],
                     })
                 attempted += len(current)
                 valid_count += sum(valid)
@@ -534,6 +609,13 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
         "configured_batch_size": configured_batch_size,
         "effective_batch_size": batch_size,
         "length_sort_window": sort_window,
+        "rolling_queue": rolling_queue,
+        "request_window": request_window,
+        "max_in_flight": _remote_max_in_flight(
+            request_window if rolling_queue else batch_size
+        )
+        if runtime["backend"] == "openai_compat"
+        else None,
         "peak_cuda_memory_bytes": (
             torch.cuda.max_memory_allocated()
             if runtime["backend"] == "transformers"
@@ -581,12 +663,28 @@ def benchmark_batch_sizes(
             explanations: list[str] = []
             valid: list[bool] = []
             attempts: list[int] = []
-            for offset in range(0, len(prompts), batch_size):
-                batch_raw, batch_explanations, batch_valid, batch_attempts = (
+            sanitized: list[bool] = []
+            rolling_queue = (
+                runtime["backend"] == "openai_compat"
+                and os.environ.get("DELTA_NLA_TEACHER_ROLLING_QUEUE", "0") == "1"
+            )
+            prior_max_in_flight = os.environ.get(
+                "DELTA_NLA_TEACHER_MAX_IN_FLIGHT"
+            )
+            os.environ["DELTA_NLA_TEACHER_MAX_IN_FLIGHT"] = str(batch_size)
+            group_size = len(prompts) if rolling_queue else batch_size
+            for offset in range(0, len(prompts), group_size):
+                (
+                    batch_raw,
+                    batch_explanations,
+                    batch_valid,
+                    batch_attempts,
+                    batch_sanitized,
+                ) = (
                     _label_prompts(
                         model,
                         processor,
-                        prompts[offset : offset + batch_size],
+                        prompts[offset : offset + group_size],
                         cfg,
                     )
                 )
@@ -594,6 +692,11 @@ def benchmark_batch_sizes(
                 explanations.extend(batch_explanations)
                 valid.extend(batch_valid)
                 attempts.extend(batch_attempts)
+                sanitized.extend(batch_sanitized)
+            if prior_max_in_flight is None:
+                os.environ.pop("DELTA_NLA_TEACHER_MAX_IN_FLIGHT", None)
+            else:
+                os.environ["DELTA_NLA_TEACHER_MAX_IN_FLIGHT"] = prior_max_in_flight
             if runtime["backend"] == "transformers":
                 torch.cuda.synchronize()
             elapsed = time.monotonic() - started
@@ -603,6 +706,8 @@ def benchmark_batch_sizes(
             baseline_canonical = [parse_explanation(output)[0] for output in baseline]
             format_valid = [parse_explanation(output)[1] for output in outputs]
             results[str(batch_size)] = {
+                "rolling_queue": rolling_queue,
+                "max_in_flight": batch_size,
                 "elapsed_seconds": elapsed,
                 "rows_per_second": len(outputs) / elapsed,
                 "rows_per_hour": len(outputs) / elapsed * 3600,
@@ -616,6 +721,7 @@ def benchmark_batch_sizes(
                 / len(explanations),
                 "total_generation_attempts": sum(attempts),
                 "retry_rate": sum(attempt > 1 for attempt in attempts) / len(attempts),
+                "sanitization_rate": sum(sanitized) / len(sanitized),
                 "exact_match_to_first_size": sum(
                     output == reference
                     for output, reference in zip(outputs, baseline, strict=True)
