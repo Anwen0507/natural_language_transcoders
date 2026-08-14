@@ -38,6 +38,10 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ValueError("RL quota cannot supply unique prompts for every configured step")
     if cfg["delta"]["injection_alpha"] <= 0:
         raise ValueError("injection_alpha must be positive")
+    if int(cfg["teacher"]["batch_size"]) <= 0:
+        raise ValueError("teacher.batch_size must be positive")
+    if int(cfg["teacher"]["max_retries"]) <= 0:
+        raise ValueError("teacher.max_retries must be positive")
 
 
 def run_dir(cfg: dict[str, Any]) -> Path:

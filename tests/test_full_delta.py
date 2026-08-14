@@ -10,6 +10,7 @@ import torch.nn as nn
 from delta_nla.data import DeltaStatistics, atomic_write_table, fixed_list_array, fixed_list_numpy
 from delta_nla.models import inject_vectors
 from delta_nla.prompts import parse_explanation
+from delta_nla import teacher
 
 
 class TinyModel(nn.Module):
@@ -72,3 +73,31 @@ def test_explanation_contract():
     assert text == "- strengthens a noun candidate\n- resolves syntax"
     _, valid = parse_explanation("just a plausible continuation")
     assert not valid
+
+
+def test_teacher_batch_retries_only_invalid_outputs(monkeypatch):
+    calls = []
+
+    def fake_generate(_model, _processor, prompts, _cfg, retry):
+        calls.append((list(prompts), retry))
+        if retry == 0:
+            return [
+                "<explanation>\n- first valid point\n- second valid point\n</explanation>",
+                "invalid",
+            ]
+        return [
+            "<explanation>\n- corrected first point\n- corrected second point\n</explanation>"
+        ]
+
+    monkeypatch.setattr(teacher, "_generate_resilient", fake_generate)
+    cfg = {"teacher": {"max_retries": 2}}
+    raw, explanations, valid, attempts = teacher._label_prompts(
+        object(), object(), ["prompt-a", "prompt-b"], cfg
+    )
+
+    assert calls == [(["prompt-a", "prompt-b"], 0), (["prompt-b"], 1)]
+    assert valid == [True, True]
+    assert attempts == [1, 2]
+    assert explanations[0] == "- first valid point\n- second valid point"
+    assert explanations[1] == "- corrected first point\n- corrected second point"
+    assert raw[1].startswith("<explanation>")
