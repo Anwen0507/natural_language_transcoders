@@ -130,6 +130,9 @@ def test_remote_prompt_forbids_visible_reasoning():
     assert "10-18 words per bullet" in retry_prompt
     assert "at most two literal token candidates" in retry_prompt
     assert "Never enumerate a sequence" in retry_prompt
+    assert "End every bullet with a period" in retry_prompt
+    assert teacher._remote_seed({"seed": 42}, 0) == 42
+    assert teacher._remote_seed({"seed": 42}, 3) == 45
 
 
 def test_remote_logit_bias_validation(monkeypatch):
@@ -155,11 +158,11 @@ def test_remote_teacher_retries_forbidden_terms(monkeypatch):
         if retry == 0:
             return [
                 "<explanation>\n- strengthens the probability of a noun ending next"
-                "\n- suppresses an unrelated punctuation continuation now\n</explanation>"
+                ".\n- suppresses an unrelated punctuation continuation now.\n</explanation>"
             ]
         return [
             "<explanation>\n- strengthens a likely noun ending as the next token"
-            "\n- suppresses an unrelated punctuation continuation now\n</explanation>"
+            ".\n- suppresses an unrelated punctuation continuation now.\n</explanation>"
         ]
 
     monkeypatch.setenv("DELTA_NLA_TEACHER_BACKEND", "openai_compat")
@@ -179,8 +182,8 @@ def test_remote_teacher_retries_forbidden_terms(monkeypatch):
 def test_remote_teacher_sanitizes_exhausted_content_violation(monkeypatch):
     output = (
         "<explanation>\n"
-        "- lowers graduate candidates by decreasing their logit scores substantially now\n"
-        "- strengthens of and from as more suitable continuations in context\n"
+        "- lowers graduate candidates by decreasing their logit scores substantially now.\n"
+        "- strengthens of and from as more suitable continuations in context.\n"
         "</explanation>"
     )
 
@@ -224,13 +227,13 @@ def test_remote_retries_receive_more_generation_room(monkeypatch):
 def test_guided_explanation_regex_enforces_bullet_word_count():
     valid = (
         "<explanation>\n"
-        "- one two three four five six seven eight nine ten\n"
-        "- one two three four five six seven eight nine ten eleven\n"
+        "- one two three four five six seven eight nine ten.\n"
+        "- one two three four five six seven eight nine ten eleven.\n"
         "</explanation>"
     )
     too_short = valid.replace(
-        "one two three four five six seven eight nine ten\n",
-        "one two three four five six seven eight nine\n",
+        "one two three four five six seven eight nine ten.\n",
+        "one two three four five six seven eight nine.\n",
         1,
     )
     assert re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, valid)
@@ -238,11 +241,11 @@ def test_guided_explanation_regex_enforces_bullet_word_count():
 
 
 def test_guided_regex_bounds_words_and_tightens_retries():
-    ten_words = "one two three four five six seven eight nine ten"
+    ten_words = "one two three four five six seven eight nine ten."
     normal = f"<explanation>\n- {ten_words}\n- {ten_words}\n</explanation>"
     three_bullets = normal.replace("\n</explanation>", f"\n- {ten_words}\n</explanation>")
     long_word = "x" * (teacher._MAX_GUIDED_WORD_CHARS + 1)
-    pathological = normal.replace("ten\n", f"{long_word}\n", 1)
+    pathological = normal.replace("ten.\n", f"{long_word}.\n", 1)
 
     assert re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, normal)
     assert re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, three_bullets)
@@ -255,6 +258,22 @@ def test_guided_regex_bounds_words_and_tightens_retries():
         teacher._guided_explanation_regex(1)
         == teacher.GUIDED_RETRY_EXPLANATION_REGEX
     )
+
+
+def test_remote_content_contract_rejects_enumeration_and_fragments():
+    valid = (
+        '- It strengthens "one" while suppressing "zero" to resolve the numeric continuation clearly.\n'
+        "- It prepares the model to finish the date with a specific final digit."
+    )
+    enumerating = valid.replace(
+        '"one" while suppressing "zero"',
+        '"one", "two", and "three"',
+    )
+    fragment = valid.removesuffix("digit.") + "the"
+
+    assert teacher._remote_explanation_content_valid(valid, retry=1)
+    assert not teacher._remote_explanation_content_valid(enumerating, retry=1)
+    assert not teacher._remote_explanation_content_valid(fragment, retry=1)
 
 
 def test_quarantined_teacher_rows_roundtrip_atomically():

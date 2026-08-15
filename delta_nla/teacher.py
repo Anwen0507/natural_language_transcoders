@@ -40,11 +40,12 @@ from delta_nla.prompts import (
 LABEL_SPLITS = ("av_sft", "ar_sft")
 _MAX_GUIDED_WORD_CHARS = 64
 _GUIDED_WORD_REGEX = rf"[^<>\s]{{1,{_MAX_GUIDED_WORD_CHARS}}}"
+_GUIDED_FINAL_WORD_REGEX = rf"[^<>\s]{{1,{_MAX_GUIDED_WORD_CHARS - 1}}}\."
 _GUIDED_BULLET_REGEX = (
-    rf"- (?:{_GUIDED_WORD_REGEX}[ \t]+){{9,24}}{_GUIDED_WORD_REGEX}"
+    rf"- (?:{_GUIDED_WORD_REGEX}[ \t]+){{9,24}}{_GUIDED_FINAL_WORD_REGEX}"
 )
 _GUIDED_RETRY_BULLET_REGEX = (
-    rf"- (?:{_GUIDED_WORD_REGEX}[ \t]+){{9,17}}{_GUIDED_WORD_REGEX}"
+    rf"- (?:{_GUIDED_WORD_REGEX}[ \t]+){{9,17}}{_GUIDED_FINAL_WORD_REGEX}"
 )
 GUIDED_EXPLANATION_REGEX = (
     r"<explanation>\n"
@@ -121,6 +122,7 @@ def _remote_prompt(prompt: str, retry: int) -> str:
         "<think> tags. Begin immediately with <explanation>. Each bullet must "
         f"contain {word_range} whitespace-delimited words. Never use the terms logits, "
         "probability, probabilities, entropy, vectors, probes, or diagnostics. "
+        "End every bullet with a period. "
         "Prioritize concrete strengthened and suppressed token candidates; avoid "
         "generic claims about diversity when concrete candidates are available."
     )
@@ -136,6 +138,31 @@ def _has_overlong_nonspace_run(explanation: str) -> bool:
     return re.search(
         rf"[^<>\s]{{{_MAX_GUIDED_WORD_CHARS + 1},}}", explanation
     ) is not None
+
+
+def _has_excessive_literal_candidates(explanation: str, retry: int) -> bool:
+    """Enforce candidate-list limits that are awkward to express in the grammar."""
+    maximum = 2 if retry else 5
+    return any(line.count('"') > maximum * 2 for line in explanation.splitlines())
+
+
+def _has_incomplete_bullet(explanation: str) -> bool:
+    """Reject grammar-capped fragments that do not finish a sentence."""
+    bullets = [line.strip() for line in explanation.splitlines() if line.strip()]
+    return not bullets or any(not line.endswith(".") for line in bullets)
+
+
+def _remote_explanation_content_valid(explanation: str, retry: int) -> bool:
+    return not (
+        _has_overlong_nonspace_run(explanation)
+        or _has_excessive_literal_candidates(explanation, retry)
+        or _has_incomplete_bullet(explanation)
+    )
+
+
+def _remote_seed(cfg: dict[str, Any], retry: int) -> int:
+    """Make sampled retries independent while preserving the first-pass seed."""
+    return int(cfg["seed"]) + retry
 
 
 def _has_forbidden_explanation_terms(explanation: str) -> bool:
@@ -213,7 +240,7 @@ def _generate_openai_batch(
                 if do_sample
                 else 0.0
             ),
-            "seed": int(cfg["seed"]),
+            "seed": _remote_seed(cfg, retry),
         }
         if do_sample:
             value["top_p"] = 0.95
@@ -455,12 +482,29 @@ def _label_prompts(
             attempts[index] += 1
             raw[index] = output
             explanations[index], valid[index] = parse_explanation(output)
-            if valid[index] and _has_overlong_nonspace_run(explanations[index]):
+            remote_backend = (
+                os.environ.get("DELTA_NLA_TEACHER_BACKEND", "transformers")
+                == "openai_compat"
+            )
+            guided = os.environ.get("DELTA_NLA_TEACHER_GUIDED_REGEX", "0") == "1"
+            if (
+                valid[index]
+                and remote_backend
+                and not _remote_explanation_content_valid(
+                    explanations[index], retry
+                )
+            ):
                 valid[index] = False
             if (
                 valid[index]
-                and os.environ.get("DELTA_NLA_TEACHER_BACKEND", "transformers")
-                == "openai_compat"
+                and remote_backend
+                and guided
+                and re.fullmatch(_guided_explanation_regex(retry), output) is None
+            ):
+                valid[index] = False
+            if (
+                valid[index]
+                and remote_backend
                 and _has_forbidden_explanation_terms(explanations[index])
             ):
                 valid[index] = False
@@ -480,6 +524,8 @@ def _label_prompts(
             if _has_forbidden_explanation_terms(candidate):
                 continue
             final_retry = max(int(cfg["teacher"]["max_retries"]) - 1, 0)
+            if not _remote_explanation_content_valid(candidate, final_retry):
+                continue
             if (
                 guided
                 and re.fullmatch(
