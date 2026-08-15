@@ -128,7 +128,7 @@ def test_remote_prompt_forbids_visible_reasoning():
     retry_prompt = teacher._remote_prompt("diagnostics", retry=1)
     assert "exactly 2 hyphen bullets" in retry_prompt
     assert "10-18 words per bullet" in retry_prompt
-    assert "at most two literal token candidates" in retry_prompt
+    assert "at most four literal token candidates" in retry_prompt
     assert "Never enumerate a sequence" in retry_prompt
     assert "End every bullet with a period" in retry_prompt
     assert teacher._remote_seed({"seed": 42}, 0) == 42
@@ -267,12 +267,22 @@ def test_remote_content_contract_rejects_enumeration_and_fragments():
     )
     enumerating = valid.replace(
         '"one" while suppressing "zero"',
-        '"one", "two", and "three"',
+        '"one", "two", "three", "four", and "five"',
+    )
+    useful_contrast = valid.replace(
+        '"one" while suppressing "zero"',
+        '"one" and "two" while suppressing "zero" and "nine"',
+    )
+    repetitive = valid.replace(
+        '"one" while suppressing "zero"',
+        '"one", "one", and "zero"',
     )
     fragment = valid.removesuffix("digit.") + "the"
 
     assert teacher._remote_explanation_content_valid(valid, retry=1)
+    assert teacher._remote_explanation_content_valid(useful_contrast, retry=1)
     assert not teacher._remote_explanation_content_valid(enumerating, retry=1)
+    assert not teacher._remote_explanation_content_valid(repetitive, retry=1)
     assert not teacher._remote_explanation_content_valid(fragment, retry=1)
 
 

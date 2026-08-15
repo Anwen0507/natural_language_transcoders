@@ -109,7 +109,7 @@ def _remote_prompt(prompt: str, retry: int) -> str:
     correction = (
         "\n\nFORMAT OR CONTENT CORRECTION: Your prior answer was unusable. "
         "Output only <explanation> followed by exactly 2 hyphen bullets and "
-        "</explanation>. Use 10-18 words per bullet and at most two literal "
+        "</explanation>. Use 10-18 words per bullet and at most four literal "
         "token candidates per bullet. Never enumerate a sequence of candidates "
         "or repeat punctuation or quoted text. Paraphrase forbidden technical "
         "terms."
@@ -140,10 +140,17 @@ def _has_overlong_nonspace_run(explanation: str) -> bool:
     ) is not None
 
 
-def _has_excessive_literal_candidates(explanation: str, retry: int) -> bool:
-    """Enforce candidate-list limits that are awkward to express in the grammar."""
-    maximum = 2 if retry else 5
-    return any(line.count('"') > maximum * 2 for line in explanation.splitlines())
+def _has_degenerate_literal_candidates(explanation: str, retry: int) -> bool:
+    """Reject malformed, repetitive, or long candidate enumerations."""
+    maximum = 4 if retry else 6
+    for line in explanation.splitlines():
+        if line.count('"') % 2:
+            return True
+        candidates = re.findall(r'"([^"\n]{1,64})"', line)
+        normalized = [candidate.casefold() for candidate in candidates]
+        if len(candidates) > maximum or len(normalized) != len(set(normalized)):
+            return True
+    return False
 
 
 def _has_incomplete_bullet(explanation: str) -> bool:
@@ -155,7 +162,7 @@ def _has_incomplete_bullet(explanation: str) -> bool:
 def _remote_explanation_content_valid(explanation: str, retry: int) -> bool:
     return not (
         _has_overlong_nonspace_run(explanation)
-        or _has_excessive_literal_candidates(explanation, retry)
+        or _has_degenerate_literal_candidates(explanation, retry)
         or _has_incomplete_bullet(explanation)
     )
 
