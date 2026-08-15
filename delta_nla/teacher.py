@@ -147,10 +147,15 @@ def _has_degenerate_literal_candidates(explanation: str, retry: int) -> bool:
         if line.count('"') % 2:
             return True
         candidates = re.findall(r'"([^"\n]{1,64})"', line)
-        normalized = [candidate.casefold() for candidate in candidates]
-        if len(candidates) > maximum or len(normalized) != len(set(normalized)):
+        if len(candidates) > maximum or len(candidates) != len(set(candidates)):
             return True
     return False
+
+
+def _has_unquoted_cjk_prose(explanation: str) -> bool:
+    """Allow quoted multilingual tokens but keep the explanatory prose English."""
+    unquoted = re.sub(r'"[^"\n]*"', "", explanation)
+    return re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", unquoted) is not None
 
 
 def _has_incomplete_bullet(explanation: str) -> bool:
@@ -163,6 +168,7 @@ def _remote_explanation_content_valid(explanation: str, retry: int) -> bool:
     return not (
         _has_overlong_nonspace_run(explanation)
         or _has_degenerate_literal_candidates(explanation, retry)
+        or _has_unquoted_cjk_prose(explanation)
         or _has_incomplete_bullet(explanation)
     )
 

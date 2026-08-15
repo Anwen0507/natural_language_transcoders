@@ -273,17 +273,28 @@ def test_remote_content_contract_rejects_enumeration_and_fragments():
         '"one" while suppressing "zero"',
         '"one" and "two" while suppressing "zero" and "nine"',
     )
+    capitalization_contrast = valid.replace(
+        '"one" while suppressing "zero"',
+        '"that" and "That" while strengthening "we" and "if"',
+    )
     repetitive = valid.replace(
         '"one" while suppressing "zero"',
         '"one", "one", and "zero"',
     )
     fragment = valid.removesuffix("digit.") + "the"
+    mixed_prose = valid.replace("numeric continuation", "学校 continuation")
+    quoted_multilingual_token = valid.replace('"one"', '"学校"')
 
     assert teacher._remote_explanation_content_valid(valid, retry=1)
     assert teacher._remote_explanation_content_valid(useful_contrast, retry=1)
+    assert teacher._remote_explanation_content_valid(capitalization_contrast, retry=1)
+    assert teacher._remote_explanation_content_valid(
+        quoted_multilingual_token, retry=1
+    )
     assert not teacher._remote_explanation_content_valid(enumerating, retry=1)
     assert not teacher._remote_explanation_content_valid(repetitive, retry=1)
     assert not teacher._remote_explanation_content_valid(fragment, retry=1)
+    assert not teacher._remote_explanation_content_valid(mixed_prose, retry=1)
 
 
 def test_quarantined_teacher_rows_roundtrip_atomically():
