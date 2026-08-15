@@ -38,7 +38,14 @@ from delta_nla.prompts import (
 
 
 LABEL_SPLITS = ("av_sft", "ar_sft")
-_GUIDED_BULLET_REGEX = r"- (?:[^<>\s]+[ \t]+){9,24}[^<>\s]+"
+_MAX_GUIDED_WORD_CHARS = 64
+_GUIDED_WORD_REGEX = rf"[^<>\s]{{1,{_MAX_GUIDED_WORD_CHARS}}}"
+_GUIDED_BULLET_REGEX = (
+    rf"- (?:{_GUIDED_WORD_REGEX}[ \t]+){{9,24}}{_GUIDED_WORD_REGEX}"
+)
+_GUIDED_RETRY_BULLET_REGEX = (
+    rf"- (?:{_GUIDED_WORD_REGEX}[ \t]+){{9,17}}{_GUIDED_WORD_REGEX}"
+)
 GUIDED_EXPLANATION_REGEX = (
     r"<explanation>\n"
     + _GUIDED_BULLET_REGEX
@@ -48,6 +55,13 @@ GUIDED_EXPLANATION_REGEX = (
     + _GUIDED_BULLET_REGEX
     + ")?"
     r"\n</explanation>"
+)
+GUIDED_RETRY_EXPLANATION_REGEX = (
+    r"<explanation>\n"
+    + _GUIDED_RETRY_BULLET_REGEX
+    + "\n"
+    + _GUIDED_RETRY_BULLET_REGEX
+    + r"\n</explanation>"
 )
 _FORBIDDEN_EXPLANATION_TERMS = re.compile(
     r"\b(?:logits?|probabilit(?:y|ies)|entropy|vectors?|probes?|diagnostics?)\b",
@@ -94,20 +108,34 @@ def _remote_prompt(prompt: str, retry: int) -> str:
     correction = (
         "\n\nFORMAT OR CONTENT CORRECTION: Your prior answer was unusable. "
         "Output only <explanation> followed by exactly 2 hyphen bullets and "
-        "</explanation>. Use 10-18 words per bullet, mention at most five "
-        "literal token candidates per bullet, and paraphrase any forbidden "
-        "technical terms."
+        "</explanation>. Use 10-18 words per bullet and at most two literal "
+        "token candidates per bullet. Never enumerate a sequence of candidates "
+        "or repeat punctuation or quoted text. Paraphrase forbidden technical "
+        "terms."
     )
+    word_range = "10-18" if retry else "10-25"
     return (
         f"{TEACHER_SYSTEM_PROMPT}\n\n{prompt}"
         f"{correction if retry else ''}\n\n"
         "This is a direct, short labeling task. Do not reveal reasoning or emit "
         "<think> tags. Begin immediately with <explanation>. Each bullet must "
-        "contain 10-25 whitespace-delimited words. Never use the terms logits, "
+        f"contain {word_range} whitespace-delimited words. Never use the terms logits, "
         "probability, probabilities, entropy, vectors, probes, or diagnostics. "
         "Prioritize concrete strengthened and suppressed token candidates; avoid "
         "generic claims about diversity when concrete candidates are available."
     )
+
+
+def _guided_explanation_regex(retry: int) -> str:
+    """Use a tighter two-bullet grammar after an invalid first response."""
+    return GUIDED_RETRY_EXPLANATION_REGEX if retry else GUIDED_EXPLANATION_REGEX
+
+
+def _has_overlong_nonspace_run(explanation: str) -> bool:
+    """Reject punctuation/quote loops that masquerade as one regex word."""
+    return re.search(
+        rf"[^<>\s]{{{_MAX_GUIDED_WORD_CHARS + 1},}}", explanation
+    ) is not None
 
 
 def _has_forbidden_explanation_terms(explanation: str) -> bool:
@@ -191,7 +219,7 @@ def _generate_openai_batch(
             value["top_p"] = 0.95
         if guided:
             # vLLM <=0.11 accepts this top-level OpenAI extension.
-            value["guided_regex"] = GUIDED_EXPLANATION_REGEX
+            value["guided_regex"] = _guided_explanation_regex(retry)
         if logit_bias:
             value["logit_bias"] = logit_bias
         return value
@@ -232,6 +260,43 @@ def _existing_ids(root: Path) -> set[str]:
             raise RuntimeError(f"duplicate teacher row IDs, sample={next(iter(overlap))}")
         ids.update(current)
     return ids
+
+
+def _quarantine_dir(root: Path) -> Path:
+    return root / "quarantine"
+
+
+def _quarantine_path(root: Path, row_id: str) -> Path:
+    digest = sha256_text(row_id)[:24]
+    return _quarantine_dir(root) / f"{digest}.json"
+
+
+def _quarantined_rows(root: Path) -> dict[str, dict[str, Any]]:
+    """Load durable exhausted rows and reject corrupt or duplicate records."""
+    records: dict[str, dict[str, Any]] = {}
+    for path in sorted(_quarantine_dir(root).glob("*.json")):
+        value = json.loads(path.read_text())
+        row_id = value.get("row_id")
+        if not isinstance(row_id, str) or not row_id:
+            raise RuntimeError(f"quarantine record lacks row_id: {path}")
+        if row_id in records:
+            raise RuntimeError(f"duplicate quarantined teacher row_id={row_id}")
+        records[row_id] = value
+    return records
+
+
+def _write_quarantined_row(
+    root: Path, row_id: str, payload: dict[str, Any]
+) -> Path:
+    """Persist one exhausted row atomically so resumptions skip it."""
+    path = _quarantine_path(root, row_id)
+    if path.exists():
+        existing = json.loads(path.read_text())
+        if existing.get("row_id") != row_id:
+            raise RuntimeError(f"quarantine filename collision at {path}")
+        return path
+    atomic_json(path, {"row_id": row_id, **payload})
+    return path
 
 
 def _rows(run: str | Path, completed: set[str]) -> Iterator[dict[str, Any]]:
@@ -390,6 +455,8 @@ def _label_prompts(
             attempts[index] += 1
             raw[index] = output
             explanations[index], valid[index] = parse_explanation(output)
+            if valid[index] and _has_overlong_nonspace_run(explanations[index]):
+                valid[index] = False
             if (
                 valid[index]
                 and os.environ.get("DELTA_NLA_TEACHER_BACKEND", "transformers")
@@ -412,7 +479,14 @@ def _label_prompts(
             candidate_raw = wrap_explanation(candidate)
             if _has_forbidden_explanation_terms(candidate):
                 continue
-            if guided and re.fullmatch(GUIDED_EXPLANATION_REGEX, candidate_raw) is None:
+            final_retry = max(int(cfg["teacher"]["max_retries"]) - 1, 0)
+            if (
+                guided
+                and re.fullmatch(
+                    _guided_explanation_regex(final_retry), candidate_raw
+                )
+                is None
+            ):
                 continue
             explanations[index] = candidate
             valid[index] = True
@@ -449,8 +523,31 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
     root = label_dir(cfg["run_dir"])
     root.mkdir(parents=True, exist_ok=True)
     completed = _existing_ids(root)
+    quarantined = _quarantined_rows(root)
+    overlap = completed.intersection(quarantined)
+    if overlap:
+        raise RuntimeError(
+            f"teacher rows are both labeled and quarantined, sample={next(iter(overlap))}"
+        )
+    quarantine_enabled = os.environ.get(
+        "DELTA_NLA_TEACHER_QUARANTINE_EXHAUSTED", "0"
+    ) == "1"
+    max_quarantined = int(
+        os.environ.get("DELTA_NLA_TEACHER_MAX_QUARANTINED", "16")
+    )
+    if max_quarantined < 0:
+        raise ValueError("maximum quarantined teacher rows cannot be negative")
+    if quarantined and not quarantine_enabled:
+        raise RuntimeError(
+            "quarantined teacher rows exist but quarantine handling is disabled"
+        )
+    if len(quarantined) > max_quarantined:
+        raise RuntimeError(
+            f"quarantined teacher rows exceed cap: {len(quarantined)} > {max_quarantined}"
+        )
+    resolved = completed.union(quarantined)
     expected = int(cfg["data"]["quotas"]["av_sft"]) + int(cfg["data"]["quotas"]["ar_sft"])
-    if len(completed) >= expected:
+    if len(resolved) >= expected:
         print("Teacher labeling already complete.")
         return
 
@@ -493,6 +590,9 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
                 "DELTA_NLA_TEACHER_GUIDED_REGEX", "0"
             )
             == "1",
+            "quarantine_exhausted": quarantine_enabled,
+            "max_quarantined": max_quarantined,
+            "existing_quarantined": len(quarantined),
         }
     }, sort_keys=True), flush=True)
 
@@ -500,36 +600,39 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
     shard_index = len(label_shards(cfg["run_dir"]))
     attempted = 0
     valid_count = 0
+    quarantined_this_process = 0
     start = time.monotonic()
+    shard_rows = int(cfg["teacher"]["shard_rows"])
 
-    def flush() -> None:
+    def flush(*, force: bool = False) -> None:
         nonlocal rows_buffer, shard_index
-        if not rows_buffer:
-            return
-        table = pa.Table.from_pylist(rows_buffer, schema=pa.schema([
-            ("row_id", pa.string()),
-            ("split", pa.string()),
-            ("explanation", pa.string()),
-            ("raw_output", pa.string()),
-            ("valid_format", pa.bool_()),
-            ("attempts", pa.int64()),
-            ("teacher_model", pa.string()),
-            ("teacher_revision", pa.string()),
-            ("teacher_backend", pa.string()),
-            ("teacher_prompt_sha256", pa.string()),
-            ("teacher_code_revision", pa.string()),
-            ("content_sanitized", pa.bool_()),
-        ]))
-        atomic_write_table(
-            table,
-            root / f"shard_{shard_index:05d}.parquet",
-            compression="zstd",
-            compression_level=5,
-        )
-        shard_index += 1
-        rows_buffer = []
+        while len(rows_buffer) >= shard_rows or (force and rows_buffer):
+            count = min(len(rows_buffer), shard_rows)
+            current_rows = rows_buffer[:count]
+            table = pa.Table.from_pylist(current_rows, schema=pa.schema([
+                ("row_id", pa.string()),
+                ("split", pa.string()),
+                ("explanation", pa.string()),
+                ("raw_output", pa.string()),
+                ("valid_format", pa.bool_()),
+                ("attempts", pa.int64()),
+                ("teacher_model", pa.string()),
+                ("teacher_revision", pa.string()),
+                ("teacher_backend", pa.string()),
+                ("teacher_prompt_sha256", pa.string()),
+                ("teacher_code_revision", pa.string()),
+                ("content_sanitized", pa.bool_()),
+            ]))
+            atomic_write_table(
+                table,
+                root / f"shard_{shard_index:05d}.parquet",
+                compression="zstd",
+                compression_level=5,
+            )
+            shard_index += 1
+            rows_buffer = rows_buffer[count:]
 
-    remaining_total = expected - len(completed)
+    remaining_total = expected - len(resolved)
     if limit is not None:
         remaining_total = min(remaining_total, limit)
     pbar = tqdm(total=remaining_total, desc=f"{model_name} teacher labels")
@@ -540,10 +643,11 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
     )
     if os.environ.get("DELTA_NLA_TEACHER_GUIDED_REGEX", "0") == "1":
         prompt_material += GUIDED_EXPLANATION_REGEX
+        prompt_material += GUIDED_RETRY_EXPLANATION_REGEX
     prompt_material += json.dumps(_remote_logit_bias(), sort_keys=True)
     prompt_sha256 = sha256_text(prompt_material)
     try:
-        source = _rows(cfg["run_dir"], completed)
+        source = _rows(cfg["run_dir"], resolved)
         # Sorting a small window by prompt length limits padding/KV-cache waste
         # while retaining bounded memory and resumability by row ID.
         while attempted < remaining_total:
@@ -571,35 +675,65 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
                 raw, explanations, valid, attempts, sanitized = _label_prompts(
                     model, processor, prompts, cfg
                 )
-                if not all(valid):
-                    failed = valid.index(False)
-                    row = current[failed][0]
-                    raise RuntimeError(
-                        "teacher failed the strict explanation contract after "
-                        f"{attempts[failed]} attempts for row_id={row['row_id']}; "
-                        f"last output={raw[failed][:500]!r}"
-                    )
                 for index, (row, _) in enumerate(current):
-                    rows_buffer.append({
-                        "row_id": row["row_id"],
-                        "split": row["split"],
-                        "explanation": explanations[index],
-                        "raw_output": raw[index],
-                        "valid_format": valid[index],
-                        "attempts": attempts[index],
-                        "teacher_model": model_name,
-                        "teacher_revision": runtime["revision"],
-                        "teacher_backend": runtime["backend"],
-                        "teacher_prompt_sha256": prompt_sha256,
-                        "teacher_code_revision": code_revision,
-                        "content_sanitized": sanitized[index],
-                    })
+                    if valid[index]:
+                        rows_buffer.append({
+                            "row_id": row["row_id"],
+                            "split": row["split"],
+                            "explanation": explanations[index],
+                            "raw_output": raw[index],
+                            "valid_format": valid[index],
+                            "attempts": attempts[index],
+                            "teacher_model": model_name,
+                            "teacher_revision": runtime["revision"],
+                            "teacher_backend": runtime["backend"],
+                            "teacher_prompt_sha256": prompt_sha256,
+                            "teacher_code_revision": code_revision,
+                            "content_sanitized": sanitized[index],
+                        })
+                        continue
+                    if not quarantine_enabled:
+                        raise RuntimeError(
+                            "teacher failed the strict explanation contract after "
+                            f"{attempts[index]} attempts for row_id={row['row_id']}; "
+                            f"last output={raw[index][:500]!r}"
+                        )
+                    _write_quarantined_row(
+                        root,
+                        row["row_id"],
+                        {
+                            "split": row["split"],
+                            "reason": "strict explanation contract exhausted",
+                            "attempts": attempts[index],
+                            "last_output": raw[index],
+                            "last_parsed_explanation": explanations[index],
+                            "teacher_model": model_name,
+                            "teacher_revision": runtime["revision"],
+                            "teacher_backend": runtime["backend"],
+                            "teacher_prompt_sha256": prompt_sha256,
+                            "teacher_code_revision": code_revision,
+                            "diagnostics_sha256": sha256_text(row["diagnostics"]),
+                        },
+                    )
+                    quarantined[row["row_id"]] = {"split": row["split"]}
+                    quarantined_this_process += 1
+                    print(
+                        "quarantined exhausted teacher row "
+                        f"row_id={row['row_id']} attempts={attempts[index]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 attempted += len(current)
                 valid_count += sum(valid)
                 pbar.update(len(current))
-                if len(rows_buffer) >= int(cfg["teacher"]["shard_rows"]):
-                    flush()
-        flush()
+                flush()
+                if len(quarantined) > max_quarantined:
+                    flush(force=True)
+                    raise RuntimeError(
+                        "quarantined teacher rows exceed cap: "
+                        f"{len(quarantined)} > {max_quarantined}"
+                    )
+        flush(force=True)
     finally:
         pbar.close()
         if model is not None:
@@ -610,11 +744,21 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
 
     elapsed = time.monotonic() - start
     all_ids = _existing_ids(root)
+    all_quarantined = _quarantined_rows(root)
+    overlap = all_ids.intersection(all_quarantined)
+    if overlap:
+        raise RuntimeError(
+            f"teacher rows are both labeled and quarantined, sample={next(iter(overlap))}"
+        )
+    resolved_rows = len(all_ids) + len(all_quarantined)
     summary = {
         "completed_rows": len(all_ids),
+        "quarantined_rows": len(all_quarantined),
+        "resolved_rows": resolved_rows,
         "expected_rows": expected,
         "rows_attempted_this_process": attempted,
         "valid_rows_this_process": valid_count,
+        "quarantined_rows_this_process": quarantined_this_process,
         "format_valid_rate_this_process": valid_count / max(attempted, 1),
         "elapsed_seconds_this_process": elapsed,
         "rows_per_hour_this_process": attempted / max(elapsed, 1e-6) * 3600,
@@ -641,8 +785,12 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
         ),
     }
     atomic_json(root / "progress.json", summary)
-    if len(all_ids) == expected:
+    if resolved_rows == expected:
         atomic_json(root / "complete.json", summary)
+    elif limit is None:
+        raise RuntimeError(
+            f"teacher resolved {resolved_rows} rows but expected {expected}"
+        )
     print(json.dumps(summary, indent=2))
 
 

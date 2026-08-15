@@ -128,6 +128,8 @@ def test_remote_prompt_forbids_visible_reasoning():
     retry_prompt = teacher._remote_prompt("diagnostics", retry=1)
     assert "exactly 2 hyphen bullets" in retry_prompt
     assert "10-18 words per bullet" in retry_prompt
+    assert "at most two literal token candidates" in retry_prompt
+    assert "Never enumerate a sequence" in retry_prompt
 
 
 def test_remote_logit_bias_validation(monkeypatch):
@@ -233,3 +235,103 @@ def test_guided_explanation_regex_enforces_bullet_word_count():
     )
     assert re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, valid)
     assert not re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, too_short)
+
+
+def test_guided_regex_bounds_words_and_tightens_retries():
+    ten_words = "one two three four five six seven eight nine ten"
+    normal = f"<explanation>\n- {ten_words}\n- {ten_words}\n</explanation>"
+    three_bullets = normal.replace("\n</explanation>", f"\n- {ten_words}\n</explanation>")
+    long_word = "x" * (teacher._MAX_GUIDED_WORD_CHARS + 1)
+    pathological = normal.replace("ten\n", f"{long_word}\n", 1)
+
+    assert re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, normal)
+    assert re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, three_bullets)
+    assert re.fullmatch(teacher.GUIDED_RETRY_EXPLANATION_REGEX, normal)
+    assert not re.fullmatch(teacher.GUIDED_RETRY_EXPLANATION_REGEX, three_bullets)
+    assert not re.fullmatch(teacher.GUIDED_EXPLANATION_REGEX, pathological)
+    assert teacher._has_overlong_nonspace_run(long_word)
+    assert teacher._guided_explanation_regex(0) == teacher.GUIDED_EXPLANATION_REGEX
+    assert (
+        teacher._guided_explanation_regex(1)
+        == teacher.GUIDED_RETRY_EXPLANATION_REGEX
+    )
+
+
+def test_quarantined_teacher_rows_roundtrip_atomically():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = teacher._write_quarantined_row(
+            root,
+            "33294:326",
+            {"split": "ar_sft", "reason": "contract exhausted"},
+        )
+        records = teacher._quarantined_rows(root)
+
+        assert path.parent == root / "quarantine"
+        assert records["33294:326"]["split"] == "ar_sft"
+        assert records["33294:326"]["reason"] == "contract exhausted"
+        assert not list(path.parent.glob("*.tmp"))
+
+
+def test_teacher_quarantines_exhausted_row_and_preserves_valid_peer(
+    monkeypatch,
+):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        extracted = root / "data" / "extracted"
+        extracted.mkdir(parents=True)
+        pq.write_table(
+            pa.table(
+                {
+                    "row_id": ["1:10", "2:20"],
+                    "split": ["av_sft", "ar_sft"],
+                    "context": ["short context", "another context"],
+                    "diagnostics": ["{}", "{}"],
+                }
+            ),
+            extracted / "shard_00000.parquet",
+        )
+        cfg = {
+            "run_dir": str(root),
+            "seed": 42,
+            "data": {"quotas": {"av_sft": 1, "ar_sft": 1}},
+            "models": {"teacher": "local", "teacher_revision": "revision"},
+            "teacher": {
+                "batch_size": 2,
+                "shard_rows": 2,
+                "max_retries": 2,
+                "max_new_tokens": 32,
+                "enable_thinking": False,
+            },
+        }
+
+        def fake_labels(_model, _processor, prompts, _cfg):
+            assert len(prompts) == 2
+            return (
+                ["valid raw", "invalid raw"],
+                ["- valid first bullet\n- valid second bullet", "invalid raw"],
+                [True, False],
+                [1, 2],
+                [False, False],
+            )
+
+        monkeypatch.setenv("DELTA_NLA_TEACHER_BACKEND", "openai_compat")
+        monkeypatch.setenv("DELTA_NLA_TEACHER_BASE_URL", "http://unused/v1")
+        monkeypatch.setenv("DELTA_NLA_TEACHER_QUARANTINE_EXHAUSTED", "1")
+        monkeypatch.setenv("DELTA_NLA_TEACHER_MAX_QUARANTINED", "1")
+        monkeypatch.setattr(teacher, "load_config", lambda _path: cfg)
+        monkeypatch.setattr(teacher, "_load_teacher", lambda _cfg: (None, None))
+        monkeypatch.setattr(teacher, "_label_prompts", fake_labels)
+
+        teacher.generate_labels("unused.yaml")
+
+        label_table = pq.read_table(root / "data" / "teacher_labels" / "shard_00000.parquet")
+        quarantined = teacher._quarantined_rows(root / "data" / "teacher_labels")
+        complete = (root / "data" / "teacher_labels" / "complete.json").read_text()
+
+        assert label_table.num_rows == 1
+        assert label_table["valid_format"].to_pylist() == [True]
+        assert len(quarantined) == 1
+        assert '"completed_rows": 1' in complete
+        assert '"quarantined_rows": 1' in complete
+        assert '"resolved_rows": 2' in complete
