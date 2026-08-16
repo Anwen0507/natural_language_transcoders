@@ -20,9 +20,9 @@ from transformers import AutoTokenizer
 from delta_nla.config import atomic_json, load_config, run_dir, seed_everything
 from delta_nla.data import DeltaStatistics, load_split_vectors
 from delta_nla.losses import reconstruction_losses
-from delta_nla.models import DeltaReconstructor, TargetProjection, load_actor
+from delta_nla.models import DeltaReconstructor, TargetProjection, inject_vectors, load_actor
 from delta_nla.policy import GeneratedBatch, generate_actor, response_log_probs
-from delta_nla.sft import TokenBuilder, _save_actor, _save_ar
+from delta_nla.sft import TrainingData, TokenBuilder, _save_actor, _save_ar
 
 
 def _append_metric(path: Path, value: dict[str, Any]) -> None:
@@ -146,6 +146,16 @@ def _warm_start_spec() -> tuple[Path, int] | None:
     return checkpoint, step
 
 
+def _cyclic_batch(values: np.ndarray, offset: int, size: int) -> np.ndarray:
+    """Take a deterministic fixed-size batch, wrapping without dropping examples."""
+    if len(values) == 0:
+        raise ValueError("cannot draw an anchor batch from an empty array")
+    if size <= 0:
+        raise ValueError("anchor batch size must be positive")
+    positions = (np.arange(size, dtype=np.int64) + int(offset)) % len(values)
+    return values[positions]
+
+
 @torch.no_grad()
 def _score_ar(
     ar,
@@ -187,15 +197,16 @@ def _update_av(
     generated: GeneratedBatch,
     x: torch.Tensor,
     advantages: torch.Tensor,
+    anchor_batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
     builder: TokenBuilder,
     cfg: dict[str, Any],
-) -> tuple[float, float, float, bool]:
+) -> tuple[float, float, float, float, bool]:
     av.train()
     reference.eval()
     optimizer.zero_grad(set_to_none=True)
     micro = int(cfg["rl"]["av_micro_batch_size"])
     n = x.shape[0]
-    total_loss = total_policy = total_kl = 0.0
+    total_loss = total_policy = total_kl = total_anchor = 0.0
     for start in range(0, n, micro):
         end = min(n, start + micro)
         weight = (end - start) / n
@@ -241,13 +252,41 @@ def _update_av(
         total_loss += float(loss.detach()) * weight
         total_policy += float(policy_loss.detach()) * weight
         total_kl += float(kl_loss.detach()) * weight
+    anchor_coefficient = float(cfg["rl"].get("av_sft_anchor_coefficient", 0.0))
+    if anchor_coefficient > 0.0:
+        if anchor_batch is None:
+            raise ValueError("positive AV SFT anchor coefficient requires an anchor batch")
+        anchor_ids, anchor_mask, anchor_labels, anchor_x = anchor_batch
+        anchor_micro = int(cfg["rl"].get("av_sft_anchor_micro_batch_size", micro))
+        anchor_n = anchor_ids.shape[0]
+        for start in range(0, anchor_n, anchor_micro):
+            end = min(anchor_n, start + anchor_micro)
+            weight = (end - start) / anchor_n
+            ids = anchor_ids[start:end].cuda()
+            mask = anchor_mask[start:end].cuda()
+            labels = anchor_labels[start:end].cuda()
+            anchor_vectors = anchor_x[start:end].cuda()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                embeds = inject_vectors(
+                    av, ids, anchor_vectors, builder.injection_token_id,
+                    float(cfg["delta"]["injection_alpha"]),
+                )
+                anchor_loss = av(
+                    inputs_embeds=embeds,
+                    attention_mask=mask,
+                    labels=labels,
+                    use_cache=False,
+                ).loss
+            (anchor_loss * anchor_coefficient * weight).backward()
+            total_loss += float(anchor_loss.detach()) * anchor_coefficient * weight
+            total_anchor += float(anchor_loss.detach()) * weight
     grad_norm = float(clip_grad_norm_(av.parameters(), float(cfg["rl"]["max_grad_norm"])))
     finite = math.isfinite(grad_norm)
     if finite:
         optimizer.step()
     else:
         optimizer.zero_grad(set_to_none=True)
-    return total_loss, total_policy, total_kl, finite
+    return total_loss, total_policy, total_kl, total_anchor, finite
 
 
 def _update_ar(
@@ -377,6 +416,18 @@ def train(config_path: str) -> None:
         raise FileNotFoundError("both AV-SFT and AR-SFT final checkpoints are required")
     tokenizer = AutoTokenizer.from_pretrained(sft_av)
     builder = TokenBuilder(tokenizer)
+    anchor_coefficient = float(cfg["rl"].get("av_sft_anchor_coefficient", 0.0))
+    if anchor_coefficient > 0.0:
+        av_anchor_data = TrainingData(cfg, "av_sft", tokenizer)
+        anchor_indices = av_anchor_data.indices(False)
+        anchor_order = np.random.default_rng(int(cfg["seed"]) + 400).permutation(
+            anchor_indices
+        )
+        anchor_batch_size = int(cfg["rl"]["av_sft_anchor_batch_size"])
+    else:
+        av_anchor_data = None
+        anchor_order = None
+        anchor_batch_size = 0
     train_data = load_split_vectors(cfg["run_dir"], "rl")
     eval_data = load_split_vectors(cfg["run_dir"], "eval")
     stats = DeltaStatistics.load(cfg["run_dir"], device="cuda")
@@ -498,8 +549,21 @@ def train(config_path: str) -> None:
             n_prompts, group, cfg,
         )
 
-        av_loss, policy_loss, policy_kl, av_finite = _update_av(
-            av, reference, av_optimizer, generated, x, advantages, builder, cfg
+        if av_anchor_data is not None and anchor_order is not None:
+            anchor_ix = _cyclic_batch(
+                anchor_order, (step - 1) * anchor_batch_size, anchor_batch_size
+            )
+            anchor_ids, anchor_mask, anchor_labels = builder.actor_batch(
+                [av_anchor_data.explanations[i] for i in anchor_ix]
+            )
+            anchor_x = torch.from_numpy(av_anchor_data.x[anchor_ix])
+            anchor_batch = (anchor_ids, anchor_mask, anchor_labels, anchor_x)
+        else:
+            anchor_batch = None
+
+        av_loss, policy_loss, policy_kl, anchor_loss, av_finite = _update_av(
+            av, reference, av_optimizer, generated, x, advantages,
+            anchor_batch, builder, cfg,
         )
         ar_loss, ar_mse, ar_kl, ar_finite, ar_examples = _update_ar(
             ar, ar_optimizer, builder, generated.explanations, generated.valid_format,
@@ -517,6 +581,7 @@ def train(config_path: str) -> None:
             "av_loss": av_loss,
             "policy_loss": policy_loss,
             "policy_kl_k2": policy_kl,
+            "av_sft_anchor_loss": anchor_loss,
             "av_update_finite": av_finite,
             "ar_loss": ar_loss,
             "ar_vector_mse": ar_mse,

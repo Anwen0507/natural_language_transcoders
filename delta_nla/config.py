@@ -46,6 +46,14 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ValueError("rl.format_guard_min_valid_rate must be in [0, 1]")
         if not 0.0 <= max_cap <= 1.0:
             raise ValueError("rl.format_guard_max_cap_hit_rate must be in [0, 1]")
+    anchor_coefficient = float(cfg["rl"].get("av_sft_anchor_coefficient", 0.0))
+    if anchor_coefficient < 0.0:
+        raise ValueError("rl.av_sft_anchor_coefficient cannot be negative")
+    if anchor_coefficient > 0.0:
+        if int(cfg["rl"].get("av_sft_anchor_batch_size", 0)) <= 0:
+            raise ValueError("rl.av_sft_anchor_batch_size must be positive")
+        if int(cfg["rl"].get("av_sft_anchor_micro_batch_size", 0)) <= 0:
+            raise ValueError("rl.av_sft_anchor_micro_batch_size must be positive")
     if cfg["delta"]["injection_alpha"] <= 0:
         raise ValueError("injection_alpha must be positive")
     if int(cfg["teacher"]["batch_size"]) <= 0:

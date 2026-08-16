@@ -144,6 +144,14 @@ def test_rl_warm_start_requires_matching_checkpoint_and_step(tmp_path, monkeypat
         rl._warm_start_spec()
 
 
+def test_rl_sft_anchor_batch_wraps_deterministically():
+    values = np.asarray([2, 5, 7])
+    np.testing.assert_array_equal(
+        rl._cyclic_batch(values, offset=2, size=5),
+        np.asarray([7, 2, 5, 7, 2]),
+    )
+
+
 def test_teacher_batch_retries_only_invalid_outputs(monkeypatch):
     calls = []
 
