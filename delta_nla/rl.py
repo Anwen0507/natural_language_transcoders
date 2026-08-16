@@ -8,6 +8,7 @@ import json
 import math
 import os
 import shutil
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,89 @@ def _atomic_torch_save(value: Any, path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(value, tmp)
     os.replace(tmp, path)
+
+
+def _reward_and_advantages(
+    score_total: torch.Tensor,
+    valid_format: torch.Tensor,
+    cap_hit: torch.Tensor,
+    n_prompts: int,
+    group_size: int,
+    cfg: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return reportable rewards and GRPO advantages with absolute safety penalties.
+
+    Format and cap penalties must be applied *after* within-group normalization.
+    Otherwise, once every sample in a group fails in the same way, subtracting the
+    group mean cancels the penalties exactly and creates an absorbing collapse.
+    """
+    quality_reward = -score_total
+    grouped = quality_reward.view(n_prompts, group_size)
+    relative_quality = (
+        (grouped - grouped.mean(dim=1, keepdim=True))
+        / grouped.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+    ).reshape(-1)
+    penalties = (
+        (~valid_format).float() * float(cfg["rl"]["invalid_format_penalty"])
+        + cap_hit.float() * float(cfg["rl"]["cap_hit_penalty"])
+    )
+    return quality_reward - penalties, relative_quality - penalties
+
+
+def _evaluation_selection_loss(
+    evaluation: dict[str, float], cfg: dict[str, Any]
+) -> float:
+    """Held-out selection objective, including the generation contract."""
+    invalid_rate = 1.0 - float(evaluation["eval_valid_format_rate"])
+    return (
+        float(evaluation["eval_total_loss"])
+        + invalid_rate * float(cfg["rl"]["invalid_format_penalty"])
+        + float(evaluation["eval_cap_hit_rate"])
+        * float(cfg["rl"]["cap_hit_penalty"])
+    )
+
+
+def _format_guard_diagnostics(
+    recent_rates: list[tuple[float, float]] | deque[tuple[float, float]],
+    cfg: dict[str, Any],
+) -> dict[str, float] | None:
+    """Detect a sustained format collapse before another checkpoint interval passes."""
+    window = int(cfg["rl"].get("format_guard_window", 0))
+    if window <= 0 or len(recent_rates) < window:
+        return None
+    tail = list(recent_rates)[-window:]
+    valid_rate = sum(valid for valid, _ in tail) / window
+    cap_rate = sum(cap for _, cap in tail) / window
+    min_valid = float(cfg["rl"]["format_guard_min_valid_rate"])
+    max_cap = float(cfg["rl"]["format_guard_max_cap_hit_rate"])
+    if valid_rate >= min_valid and cap_rate <= max_cap:
+        return None
+    return {
+        "window": window,
+        "rolling_valid_format_rate": valid_rate,
+        "rolling_cap_hit_rate": cap_rate,
+        "minimum_valid_format_rate": min_valid,
+        "maximum_cap_hit_rate": max_cap,
+    }
+
+
+def _warm_start_spec() -> tuple[Path, int] | None:
+    checkpoint_value = os.environ.get("DELTA_NLA_RL_WARM_START_CHECKPOINT")
+    step_value = os.environ.get("DELTA_NLA_RL_WARM_START_STEP")
+    if checkpoint_value is None and step_value is None:
+        return None
+    if not checkpoint_value or step_value is None:
+        raise ValueError(
+            "DELTA_NLA_RL_WARM_START_CHECKPOINT and "
+            "DELTA_NLA_RL_WARM_START_STEP must be set together"
+        )
+    checkpoint = Path(checkpoint_value).expanduser().resolve()
+    step = int(step_value)
+    if step < 0:
+        raise ValueError("DELTA_NLA_RL_WARM_START_STEP cannot be negative")
+    if not (checkpoint / "av").is_dir() or not (checkpoint / "ar").is_dir():
+        raise FileNotFoundError(f"warm-start checkpoint lacks AV/AR directories: {checkpoint}")
+    return checkpoint, step
 
 
 @torch.no_grad()
@@ -246,13 +330,14 @@ def _evaluate(
         "eval_valid_format_rate": float(generated.valid_format.float().mean()),
         "eval_cap_hit_rate": float(generated.cap_hit.float().mean()),
     }
+    result["eval_selection_loss"] = _evaluation_selection_loss(result, cfg)
     _restore_rng(saved_rng)
     return result
 
 
 def _save_checkpoint(
     root: Path, step: int, av, ar, tokenizer, av_optimizer, ar_optimizer,
-    cfg: dict[str, Any], best: float, stale: int,
+    cfg: dict[str, Any], best: float, best_step: int, stale: int,
 ) -> Path:
     checkpoint = root / "checkpoints" / f"step_{step:06d}"
     _save_actor(av, tokenizer, checkpoint / "av", {
@@ -268,6 +353,7 @@ def _save_checkpoint(
         "av_optimizer": av_optimizer.state_dict(),
         "ar_optimizer": ar_optimizer.state_dict(),
         "best_eval_score": best,
+        "best_eval_step": best_step,
         "stale_evaluations": stale,
         "rng": _rng_state(),
     }
@@ -297,20 +383,40 @@ def train(config_path: str) -> None:
     projection = TargetProjection.load(cfg["run_dir"], device="cuda")
 
     state_path = root / "trainer_state.pt"
+    warm_start = _warm_start_spec()
     if state_path.exists():
+        if warm_start is not None:
+            print("Ignoring warm-start environment because trainer_state.pt exists.", flush=True)
         state = torch.load(state_path, map_location="cpu", weights_only=False)
         checkpoint = Path(state["checkpoint"])
         av = load_actor(checkpoint / "av", dtype=torch.float32, device="cuda")
         ar = DeltaReconstructor.from_checkpoint(checkpoint / "ar", dtype=torch.float32, device="cuda")
         start_step = int(state["step"])
         best = float(state["best_eval_score"])
+        best_step = int(state.get("best_eval_step", start_step))
         stale = int(state["stale_evaluations"])
+    elif warm_start is not None:
+        state = None
+        checkpoint, start_step = warm_start
+        av = load_actor(checkpoint / "av", dtype=torch.float32, device="cuda")
+        ar = DeltaReconstructor.from_checkpoint(
+            checkpoint / "ar", dtype=torch.float32, device="cuda"
+        )
+        best = -math.inf
+        best_step = start_step
+        stale = 0
+        atomic_json(root / "warm_start.json", {
+            "checkpoint": str(checkpoint),
+            "step": start_step,
+            "optimizer_state": "fresh",
+        })
     else:
         state = None
         av = load_actor(sft_av, dtype=torch.float32, device="cuda")
         ar = DeltaReconstructor.from_checkpoint(sft_ar, dtype=torch.float32, device="cuda")
         start_step = 0
         best = -math.inf
+        best_step = 0
         stale = 0
     reference = load_actor(sft_av, dtype=torch.bfloat16, device="cuda").eval()
     reference.requires_grad_(False)
@@ -336,13 +442,36 @@ def train(config_path: str) -> None:
     )[:required]
     metrics_path = root / "metrics.jsonl"
 
-    if start_step == 0:
+    if state is None:
         initial_eval = _evaluate(
-            av, ar, tokenizer, builder, eval_data, stats, projection, cfg, 0
+            av, ar, tokenizer, builder, eval_data, stats, projection, cfg, start_step
         )
-        _append_metric(metrics_path, {"step": 0, **initial_eval})
-        print(json.dumps({"step": 0, **initial_eval}), flush=True)
-        best = -initial_eval["eval_total_loss"]
+        _append_metric(metrics_path, {"step": start_step, **initial_eval})
+        print(json.dumps({"step": start_step, **initial_eval}), flush=True)
+        best = -initial_eval["eval_selection_loss"]
+        best_step = start_step
+        if warm_start is not None:
+            best_av = warm_start[0] / "av"
+            best_ar = warm_start[0] / "ar"
+        else:
+            best_av, best_ar = sft_av, sft_ar
+        atomic_json(root / "best.json", {
+            "step": best_step,
+            "av": str(best_av),
+            "ar": str(best_ar),
+            "eval_selection_loss": -best,
+        })
+
+    guard_window = int(cfg["rl"].get("format_guard_window", 0))
+    recent_rates: deque[tuple[float, float]] = deque(maxlen=max(guard_window, 1))
+    if metrics_path.exists() and guard_window > 0:
+        for line in metrics_path.read_text().splitlines():
+            previous = json.loads(line)
+            if "valid_format_rate" in previous:
+                recent_rates.append((
+                    float(previous["valid_format_rate"]),
+                    float(previous["cap_hit_rate"]),
+                ))
 
     stopped_early = False
     for step in range(start_step + 1, max_steps + 1):
@@ -364,14 +493,10 @@ def train(config_path: str) -> None:
         score_total, score_mse, score_kl, _ = _score_ar(
             ar, builder, generated.explanations, x, r0_group, stats, projection, cfg
         )
-        reward = -score_total
-        reward = reward - (~generated.valid_format).float() * float(cfg["rl"]["invalid_format_penalty"])
-        reward = reward - generated.cap_hit.float() * float(cfg["rl"]["cap_hit_penalty"])
-        grouped = reward.view(n_prompts, group)
-        advantages = (
-            (grouped - grouped.mean(dim=1, keepdim=True))
-            / grouped.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
-        ).reshape(-1)
+        reward, advantages = _reward_and_advantages(
+            score_total, generated.valid_format, generated.cap_hit,
+            n_prompts, group, cfg,
+        )
 
         av_loss, policy_loss, policy_kl, av_finite = _update_av(
             av, reference, av_optimizer, generated, x, advantages, builder, cfg
@@ -398,9 +523,19 @@ def train(config_path: str) -> None:
             "ar_prediction_kl": ar_kl,
             "ar_update_finite": ar_finite,
             "ar_examples": ar_examples,
+            "advantage_mean": float(advantages.mean()),
         }
         _append_metric(metrics_path, record)
         print(json.dumps(record), flush=True)
+
+        recent_rates.append((record["valid_format_rate"], record["cap_hit_rate"]))
+        guard = _format_guard_diagnostics(recent_rates, cfg)
+        if guard is not None:
+            guard_record = {"step": step, **guard}
+            atomic_json(root / "FORMAT_COLLAPSE.json", guard_record)
+            raise RuntimeError(
+                "RL format-collapse guard triggered: " + json.dumps(guard_record, sort_keys=True)
+            )
 
         evaluate_now = step % int(cfg["rl"]["evaluation_interval"]) == 0
         save_now = step % int(cfg["rl"]["checkpoint_interval"]) == 0
@@ -410,16 +545,23 @@ def train(config_path: str) -> None:
             )
             _append_metric(metrics_path, {"step": step, **evaluation})
             print(json.dumps({"step": step, **evaluation}), flush=True)
-            score = -evaluation["eval_total_loss"]
+            score = -evaluation["eval_selection_loss"]
             if score > best + 1e-4:
-                best, stale = score, 0
+                best, best_step, stale = score, step, 0
             else:
                 stale += 1
         if save_now or evaluate_now:
-            _save_checkpoint(
+            checkpoint = _save_checkpoint(
                 root, step, av, ar, tokenizer, av_optimizer, ar_optimizer,
-                cfg, best, stale,
+                cfg, best, best_step, stale,
             )
+            if best_step == step:
+                atomic_json(root / "best.json", {
+                    "step": best_step,
+                    "av": str(checkpoint / "av"),
+                    "ar": str(checkpoint / "ar"),
+                    "eval_selection_loss": -best,
+                })
         if (
             step >= int(cfg["rl"]["minimum_steps"])
             and stale >= int(cfg["rl"]["early_stopping_patience"])
@@ -428,18 +570,22 @@ def train(config_path: str) -> None:
             break
 
     final_step = step
-    _save_actor(av, tokenizer, final / "av", {
-        "stage": "rl", "role": "av", "step": final_step,
-        "group_size": group,
-    })
-    _save_ar(ar, final / "ar", cfg, {
-        "stage": "rl", "role": "ar", "step": final_step, "full_depth": True,
-    })
+    best_record = json.loads((root / "best.json").read_text())
+    temporary_final = root / "final.tmp"
+    if temporary_final.exists():
+        shutil.rmtree(temporary_final)
+    if final.exists():
+        raise RuntimeError(f"refusing to overwrite unexpected partial final directory: {final}")
+    shutil.copytree(best_record["av"], temporary_final / "av")
+    shutil.copytree(best_record["ar"], temporary_final / "ar")
+    os.replace(temporary_final, final)
     atomic_json(root / "complete.json", {
         "final_step": final_step,
         "maximum_steps": max_steps,
         "stopped_early": stopped_early,
         "best_eval_score": best,
+        "best_eval_selection_loss": -best,
+        "selected_step": int(best_record["step"]),
         "final": str(final),
     })
 

@@ -36,6 +36,16 @@ def validate_config(cfg: dict[str, Any]) -> None:
         raise ValueError("GRPO group_size must be at least two")
     if cfg["rl"]["prompts_per_step"] * cfg["rl"]["max_steps"] > quotas["rl"]:
         raise ValueError("RL quota cannot supply unique prompts for every configured step")
+    guard_window = int(cfg["rl"].get("format_guard_window", 0))
+    if guard_window < 0:
+        raise ValueError("rl.format_guard_window cannot be negative")
+    if guard_window > 0:
+        min_valid = float(cfg["rl"]["format_guard_min_valid_rate"])
+        max_cap = float(cfg["rl"]["format_guard_max_cap_hit_rate"])
+        if not 0.0 <= min_valid <= 1.0:
+            raise ValueError("rl.format_guard_min_valid_rate must be in [0, 1]")
+        if not 0.0 <= max_cap <= 1.0:
+            raise ValueError("rl.format_guard_max_cap_hit_rate must be in [0, 1]")
     if cfg["delta"]["injection_alpha"] <= 0:
         raise ValueError("injection_alpha must be positive")
     if int(cfg["teacher"]["batch_size"]) <= 0:

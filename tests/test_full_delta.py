@@ -5,13 +5,14 @@ import re
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 import torch.nn as nn
 
 from delta_nla.data import DeltaStatistics, atomic_write_table, fixed_list_array, fixed_list_numpy
 from delta_nla.models import inject_vectors
 from delta_nla.prompts import parse_explanation
-from delta_nla import teacher
+from delta_nla import rl, teacher
 
 
 class TinyModel(nn.Module):
@@ -74,6 +75,73 @@ def test_explanation_contract():
     assert text == "- strengthens a noun candidate\n- resolves syntax"
     _, valid = parse_explanation("just a plausible continuation")
     assert not valid
+
+
+def test_rl_format_penalties_survive_group_normalization():
+    cfg = {"rl": {"invalid_format_penalty": 1.0, "cap_hit_penalty": 0.25}}
+    score_total = torch.ones(8)
+    valid = torch.zeros(8, dtype=torch.bool)
+    capped = torch.ones(8, dtype=torch.bool)
+
+    reward, advantages = rl._reward_and_advantages(
+        score_total, valid, capped, n_prompts=1, group_size=8, cfg=cfg
+    )
+
+    assert torch.allclose(reward, torch.full((8,), -2.25))
+    # The within-group reconstruction advantages are zero, but the absolute
+    # contract penalties must remain instead of cancelling to zero.
+    assert torch.allclose(advantages, torch.full((8,), -1.25))
+
+
+def test_rl_selection_loss_rejects_low_loss_format_collapse():
+    cfg = {"rl": {"invalid_format_penalty": 1.0, "cap_hit_penalty": 0.25}}
+    healthy = {
+        "eval_total_loss": 0.4891955554485321,
+        "eval_valid_format_rate": 0.98828125,
+        "eval_cap_hit_rate": 0.01171875,
+    }
+    collapsed = {
+        "eval_total_loss": 0.479,
+        "eval_valid_format_rate": 0.0,
+        "eval_cap_hit_rate": 1.0,
+    }
+
+    assert rl._evaluation_selection_loss(healthy, cfg) < 0.51
+    assert rl._evaluation_selection_loss(collapsed, cfg) == pytest.approx(1.729)
+    assert rl._evaluation_selection_loss(healthy, cfg) < rl._evaluation_selection_loss(
+        collapsed, cfg
+    )
+
+
+def test_rl_format_guard_requires_sustained_failure():
+    cfg = {
+        "rl": {
+            "format_guard_window": 20,
+            "format_guard_min_valid_rate": 0.5,
+            "format_guard_max_cap_hit_rate": 0.5,
+        }
+    }
+    assert rl._format_guard_diagnostics([(0.95, 0.05)] * 20, cfg) is None
+    assert rl._format_guard_diagnostics([(0.0, 1.0)] * 19, cfg) is None
+
+    failure = rl._format_guard_diagnostics([(0.0, 1.0)] * 20, cfg)
+    assert failure is not None
+    assert failure["rolling_valid_format_rate"] == 0.0
+    assert failure["rolling_cap_hit_rate"] == 1.0
+
+
+def test_rl_warm_start_requires_matching_checkpoint_and_step(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "checkpoint"
+    (checkpoint / "av").mkdir(parents=True)
+    (checkpoint / "ar").mkdir()
+    monkeypatch.setenv("DELTA_NLA_RL_WARM_START_CHECKPOINT", str(checkpoint))
+    monkeypatch.setenv("DELTA_NLA_RL_WARM_START_STEP", "750")
+
+    assert rl._warm_start_spec() == (checkpoint.resolve(), 750)
+
+    monkeypatch.delenv("DELTA_NLA_RL_WARM_START_STEP")
+    with pytest.raises(ValueError, match="must be set together"):
+        rl._warm_start_spec()
 
 
 def test_teacher_batch_retries_only_invalid_outputs(monkeypatch):
