@@ -178,6 +178,11 @@ def _remote_seed(cfg: dict[str, Any], retry: int) -> int:
     return int(cfg["seed"]) + retry
 
 
+def _strict_local_contract_enabled() -> bool:
+    """Opt local fallback generation into the hardened production contract."""
+    return os.environ.get("DELTA_NLA_TEACHER_STRICT_LOCAL_CONTRACT", "0") == "1"
+
+
 def _has_forbidden_explanation_terms(explanation: str) -> bool:
     """Return whether a label violates the teacher's plain-language contract."""
     return _FORBIDDEN_EXPLANATION_TERMS.search(explanation) is not None
@@ -395,10 +400,19 @@ def _generate_batch(
         return []
     if _teacher_runtime(cfg)["backend"] == "openai_compat":
         return _generate_openai_batch(prompts, cfg, retry)
-    correction = (
-        "\n\nFORMAT CORRECTION: Your prior answer was unusable. Output only "
-        "<explanation> followed by 2-3 hyphen bullets and </explanation>."
-    )
+    if _strict_local_contract_enabled():
+        correction = (
+            "\n\nFORMAT OR CONTENT CORRECTION: Your prior answer was unusable. "
+            "Output only <explanation> followed by exactly 2 hyphen bullets and "
+            "</explanation>. Use 10-18 whitespace-delimited words per bullet, "
+            "end each bullet with a period, use at most four quoted token "
+            "candidates per bullet, and avoid technical terms named in the prompt."
+        )
+    else:
+        correction = (
+            "\n\nFORMAT CORRECTION: Your prior answer was unusable. Output only "
+            "<explanation> followed by 2-3 hyphen bullets and </explanation>."
+        )
     conversations = [
         [
             {"role": "system", "content": TEACHER_SYSTEM_PROMPT},
@@ -499,10 +513,14 @@ def _label_prompts(
                 os.environ.get("DELTA_NLA_TEACHER_BACKEND", "transformers")
                 == "openai_compat"
             )
+            strict_local = (
+                not remote_backend and _strict_local_contract_enabled()
+            )
+            strict_content = remote_backend or strict_local
             guided = os.environ.get("DELTA_NLA_TEACHER_GUIDED_REGEX", "0") == "1"
             if (
                 valid[index]
-                and remote_backend
+                and strict_content
                 and not _remote_explanation_content_valid(
                     explanations[index], retry
                 )
@@ -517,14 +535,30 @@ def _label_prompts(
                 valid[index] = False
             if (
                 valid[index]
-                and remote_backend
+                and strict_local
+                and guided
+                and re.fullmatch(
+                    _guided_explanation_regex(retry),
+                    wrap_explanation(explanations[index]),
+                )
+                is None
+            ):
+                valid[index] = False
+            if (
+                valid[index]
+                and strict_content
                 and _has_forbidden_explanation_terms(explanations[index])
             ):
                 valid[index] = False
     # A forbidden vocabulary term is a style violation, not a reason to discard
     # an otherwise grounded, structurally valid label or terminate a long run.
     # Preserve the original response in raw_output and sanitize only the SFT text.
-    if os.environ.get("DELTA_NLA_TEACHER_BACKEND", "transformers") == "openai_compat":
+    remote_backend = (
+        os.environ.get("DELTA_NLA_TEACHER_BACKEND", "transformers")
+        == "openai_compat"
+    )
+    strict_local = not remote_backend and _strict_local_contract_enabled()
+    if remote_backend or strict_local:
         guided = os.environ.get("DELTA_NLA_TEACHER_GUIDED_REGEX", "0") == "1"
         for index, is_valid in enumerate(valid):
             if is_valid:
@@ -539,13 +573,9 @@ def _label_prompts(
             final_retry = max(int(cfg["teacher"]["max_retries"]) - 1, 0)
             if not _remote_explanation_content_valid(candidate, final_retry):
                 continue
-            if (
-                guided
-                and re.fullmatch(
-                    _guided_explanation_regex(final_retry), candidate_raw
-                )
-                is None
-            ):
+            if guided and re.fullmatch(
+                _guided_explanation_regex(final_retry), candidate_raw
+            ) is None:
                 continue
             explanations[index] = candidate
             valid[index] = True
@@ -703,6 +733,8 @@ def generate_labels(config_path: str, limit: int | None = None) -> None:
     if os.environ.get("DELTA_NLA_TEACHER_GUIDED_REGEX", "0") == "1":
         prompt_material += GUIDED_EXPLANATION_REGEX
         prompt_material += GUIDED_RETRY_EXPLANATION_REGEX
+    if _strict_local_contract_enabled():
+        prompt_material += "strict-local-contract-v1"
     prompt_material += json.dumps(_remote_logit_bias(), sort_keys=True)
     prompt_sha256 = sha256_text(prompt_material)
     try:

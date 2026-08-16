@@ -205,6 +205,69 @@ def test_remote_teacher_sanitizes_exhausted_content_violation(monkeypatch):
     assert not teacher._has_forbidden_explanation_terms(explanations[0])
 
 
+def test_strict_local_teacher_retries_to_hardened_contract(monkeypatch):
+    calls = []
+
+    def fake_generate(_model, _processor, prompts, _cfg, retry):
+        calls.append((list(prompts), retry))
+        if retry == 0:
+            return [
+                "<explanation>\n"
+                "- The transformer strengthens the probability of a noun ending as the next token.\n"
+                "- It suppresses unrelated punctuation while preparing a coherent grammatical continuation next.\n"
+                "</explanation>"
+            ]
+        return [
+            "<explanation>\n"
+            "- The transformer strengthens a likely noun ending as the next candidate token.\n"
+            "- It suppresses unrelated punctuation while preparing a coherent grammatical continuation next.\n"
+            "</explanation>"
+        ]
+
+    monkeypatch.delenv("DELTA_NLA_TEACHER_BACKEND", raising=False)
+    monkeypatch.setenv("DELTA_NLA_TEACHER_STRICT_LOCAL_CONTRACT", "1")
+    monkeypatch.setenv("DELTA_NLA_TEACHER_GUIDED_REGEX", "1")
+    monkeypatch.setattr(teacher, "_generate_resilient", fake_generate)
+    cfg = {"teacher": {"max_retries": 2}}
+    _, explanations, valid, attempts, sanitized = teacher._label_prompts(
+        object(), object(), ["prompt"], cfg
+    )
+
+    assert calls == [(["prompt"], 0), (["prompt"], 1)]
+    assert valid == [True]
+    assert attempts == [2]
+    assert sanitized == [False]
+    assert not teacher._has_forbidden_explanation_terms(explanations[0])
+
+
+def test_strict_local_teacher_sanitizes_exhausted_style_violation(monkeypatch):
+    output = (
+        "<explanation>\n"
+        "- Lowers graduate candidates by decreasing their logit scores substantially right now.\n"
+        "- It strengthens of and from as more suitable continuations in context.\n"
+        "</explanation>"
+    )
+
+    def fake_generate(_model, _processor, prompts, _cfg, _retry):
+        return [output for _ in prompts]
+
+    monkeypatch.delenv("DELTA_NLA_TEACHER_BACKEND", raising=False)
+    monkeypatch.setenv("DELTA_NLA_TEACHER_STRICT_LOCAL_CONTRACT", "1")
+    monkeypatch.setenv("DELTA_NLA_TEACHER_GUIDED_REGEX", "1")
+    monkeypatch.setattr(teacher, "_generate_resilient", fake_generate)
+    cfg = {"teacher": {"max_retries": 2}}
+    raw, explanations, valid, attempts, sanitized = teacher._label_prompts(
+        object(), object(), ["prompt"], cfg
+    )
+
+    assert "logit scores" in raw[0]
+    assert "candidate support" in explanations[0]
+    assert valid == [True]
+    assert attempts == [2]
+    assert sanitized == [True]
+    assert not teacher._has_forbidden_explanation_terms(explanations[0])
+
+
 def test_remote_max_in_flight_uses_rolling_limit(monkeypatch):
     monkeypatch.setenv("DELTA_NLA_TEACHER_MAX_IN_FLIGHT", "48")
     assert teacher._remote_max_in_flight(256) == 48
