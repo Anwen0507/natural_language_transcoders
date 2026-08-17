@@ -1,0 +1,19 @@
+# Tested single-H100 runtime. Host NVIDIA driver remains untouched.
+torch==2.8.0
+torchvision==0.23.0
+transformers==5.10.4
+accelerate==1.12.0
+datasets==4.8.5
+pyarrow==21.0.0
+safetensors==0.6.2
+huggingface-hub==1.5.0
+tokenizers==0.22.2
+sentencepiece==0.2.1
+protobuf==6.32.0
+PyYAML==6.0.2
+numpy==2.1.3
+tqdm==4.67.1
+psutil==7.0.0
+pytest==8.4.2
+anthropic==0.122.0
+orjson==3.11.9
